@@ -11,6 +11,12 @@ import {
 } from "./lib/dashboard";
 import { scanTokenFiles, type FileScanResult } from "./lib/token-scan";
 import {
+  mergeDaily,
+  scanBbThreadUsage,
+  type BbUsageEvent,
+  type BbUsageTotal,
+} from "./lib/bb-usage-scan";
+import {
   TOKEN_WINDOWS,
   assembleTokenSnapshot,
   formatTokenText,
@@ -322,16 +328,66 @@ function createTokenStore(bb: BbPluginApi) {
       (path) => path.includes("acp-sessions") || path.endsWith("store.db"),
     );
 
+  /**
+   * Every provider bb can drive, without a scanner per vendor: bb's own
+   * `thread/tokenUsage/updated` is part of the provider-bridge contract, so an
+   * agent the plugin has never heard of still lands in the chart as soon as it
+   * reports usage. Providers with a dedicated transcript scanner are skipped
+   * inside scanBbThreadUsage so they are not counted twice.
+   */
+  const scanBbThreads = async (nowMs: number) =>
+    scanBbThreadUsage({
+      nowMs,
+      onError: (error) =>
+        bb.log.warn(
+          `bb thread usage scan: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      listThreads: async () => {
+        const rows = await bb.sdk.threads.list({ includeHidden: true });
+        return rows.map((row) => ({
+          id: row.id,
+          providerId: row.providerId,
+          updatedAt: row.updatedAt,
+        }));
+      },
+      listEvents: async (threadId) => {
+        const rows = await bb.sdk.threads.events.list({
+          threadId,
+          types: ["thread/tokenUsage/updated"],
+        });
+        const events: BbUsageEvent[] = [];
+        for (const row of rows) {
+          if (row.type !== "thread/tokenUsage/updated") continue;
+          const total = row.data.tokenUsage?.total as BbUsageTotal | undefined;
+          if (!total) continue;
+          events.push({ seq: row.seq, createdAt: row.createdAt, total });
+        }
+        return events;
+      },
+    });
+
   const sync = async (days: TokenWindowDays, force = false) => {
     if (inflight) return inflight;
     inflight = (async () => {
+      const nowMs = Date.now();
       const cached = force ? new Map() : loadCache;
-      const jsonl = await scanTokenFiles({ cached, includeCursor: false });
+      const jsonl = await scanTokenFiles({
+        cached,
+        includeCursor: false,
+        includeOpencode: false,
+      });
       persistFiles(jsonl.files);
       snapshotFrom(days, jsonl);
       publish();
       const full = await scanTokenFiles({ cached: loadCache, includeCursor: true });
       persistFiles(full.files);
+      const bbUsage = await scanBbThreads(nowMs);
+      mergeDaily(full.daily, bbUsage.daily);
+      full.sources.push(...bbUsage.providers);
+      bb.log.info(
+        `bb thread usage: ${bbUsage.threadsScanned} thread(s) reporting, ` +
+          `providers [${bbUsage.providers.join(", ") || "none"}]`,
+      );
       const snapshot = snapshotFrom(days, full);
       publish();
       return snapshot;

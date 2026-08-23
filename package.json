@@ -1,7 +1,7 @@
 {
   "name": "bb-plugin-provider-usage",
-  "version": "0.3.0",
-  "description": "Subscription limits, remaining quota, reset windows, and global token usage across every provider you are signed in to.",
+  "version": "0.4.0",
+  "description": "Remaining plan quota and reset windows for every signed-in provider, plus 7/30/90-day token volume from local transcripts and BB's own usage events.",
   "license": "MIT",
   "author": "Braedon Saunders",
   "type": "module",

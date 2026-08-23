@@ -102,19 +102,33 @@ export function enumerateDays(days: TokenWindowDays, endMs = Date.now()): string
   return keys;
 }
 
+/**
+ * Names bb uses for the agents it ships with. Anything else is title-cased
+ * from its id rather than dropped, so a provider added after this release
+ * still reads as a name instead of a slug.
+ */
+const PROVIDER_NAMES: Record<string, string> = {
+  codex: "Codex",
+  "claude-code": "Claude Code",
+  cursor: "Cursor",
+  opencode: "opencode",
+  pi: "Pi",
+  grok: "Grok",
+  "hermes-agent": "Hermes Agent",
+  omp: "oh-my-pi",
+  gemini: "Gemini",
+  amp: "Amp",
+  copilot: "Copilot",
+};
+
 export function providerDisplayName(id: string): string {
-  switch (id) {
-    case "codex":
-      return "Codex";
-    case "claude-code":
-      return "Claude Code";
-    case "cursor":
-      return "Cursor";
-    case "opencode":
-      return "opencode";
-    default:
-      return id;
-  }
+  const known = PROVIDER_NAMES[id];
+  if (known) return known;
+  return id
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 export function assembleTokenSnapshot(input: {

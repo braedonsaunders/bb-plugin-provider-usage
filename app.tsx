@@ -56,8 +56,29 @@ const PROVIDER_SWATCH: Record<string, string> = {
   opencode: "var(--chart-4, #2563eb)",
 };
 
+/**
+ * Providers arrive from bb's own event stream as well as the built-in
+ * scanners, so the chart cannot assume it knows every id. An unrecognised one
+ * gets a stable hue derived from its id rather than the same grey as every
+ * other unknown, which would make two of them indistinguishable.
+ */
+const FALLBACK_SWATCHES = [
+  "var(--chart-5, #8b5cf6)",
+  "var(--chart-2, #14b8a6)",
+  "var(--chart-1, #ec4899)",
+  "#0ea5e9",
+  "#84cc16",
+  "#f43f5e",
+];
+
 function providerSwatch(id: string): string {
-  return PROVIDER_SWATCH[id] ?? "var(--muted-foreground)";
+  const known = PROVIDER_SWATCH[id];
+  if (known) return known;
+  let hash = 0;
+  for (let i = 0; i < id.length; i += 1) {
+    hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+  }
+  return FALLBACK_SWATCHES[hash % FALLBACK_SWATCHES.length]!;
 }
 
 function useDashboard(hostId: string | null) {

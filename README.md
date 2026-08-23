@@ -17,11 +17,23 @@ nearly-exhausted one is obvious at a glance.
 them, the single tightest window right now, and the next reset — absolute and
 relative.
 
-**Token usage.** A 7 / 30 / 90-day multi-series chart of real token volume read
-straight off local transcripts — Codex (`~/.codex`, or `$CODEX_HOME`), Claude
-Code (`~/.claude`, or `$CLAUDE_CONFIG_DIR`), Cursor's ACP session stores, and
-opencode (`~/.local/share/opencode`, or `$XDG_DATA_HOME/opencode`) — broken out
-into total, input, output, and cached, per provider.
+**Token usage, for every provider.** A 7 / 30 / 90-day multi-series chart of
+real token volume, broken out into total, input, output, and cached, per
+provider. It reads from two tiers:
+
+- **Transcript scanners** for the agents that keep detailed local records —
+  Codex (`~/.codex`, or `$CODEX_HOME`), Claude Code (`~/.claude`, or
+  `$CLAUDE_CONFIG_DIR`), Cursor's ACP session stores, and opencode
+  (`~/.local/share/opencode`, or `$XDG_DATA_HOME/opencode`). These give full
+  history and exact per-day attribution, back to before you installed BB.
+- **BB's own usage events** for everything else. `thread/tokenUsage/updated` is
+  part of the provider-bridge contract every provider plugin implements, so an
+  agent this plugin has never heard of — a new ACP agent, one you wrote
+  yourself — lands in the chart automatically as soon as it reports usage, with
+  a name and a colour of its own. No release here required.
+
+Providers with a dedicated scanner are excluded from the second tier, so
+nothing is counted twice.
 
 **Multi-machine.** If you have more than one host paired, a machine picker
 switches the whole view between them.
@@ -70,6 +82,17 @@ Token totals come from a background `token-scan` service that walks local
 transcript files, caches per-file results in the plugin's SQLite database, and
 re-syncs every 15 minutes. Only sources whose size or mtime changed are re-read,
 so a large history stays cheap. Nothing is uploaded anywhere.
+
+The same pass asks BB for `thread/tokenUsage/updated` on any thread whose
+provider has no dedicated scanner. Those events carry the thread's *running*
+total rather than the turn's, so consecutive events are differenced; a total
+that goes backwards means the thread was compacted or restarted upstream and is
+read as a fresh total rather than a negative one.
+
+A caveat worth stating plainly: the second tier only sees what a provider
+actually reports. Providers that never emit `thread/tokenUsage/updated` will
+show subscription windows but no token series, and some agents (Factory Droid,
+Hermes) keep no usable per-turn token record on disk at all.
 
 ## Develop
 
