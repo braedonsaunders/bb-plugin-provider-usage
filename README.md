@@ -1,4 +1,4 @@
-# Usage
+# Provider Usage
 
 A BB panel for **how much of your plan is left** and **how many tokens you are
 actually burning** — across every provider you are signed in to, on every
@@ -33,14 +33,14 @@ window follows you around without opening the panel.
 From the BB marketplace:
 
 ```bash
-bb plugin install usage
+bb plugin install provider-usage
 ```
 
 Or from a local checkout:
 
 ```bash
-git clone https://github.com/braedonsaunders/bb-plugin-usage.git
-cd bb-plugin-usage
+git clone https://github.com/braedonsaunders/bb-plugin-provider-usage.git
+cd bb-plugin-provider-usage
 npm install --include=dev
 bb plugin install . --yes
 ```
@@ -81,14 +81,26 @@ bb plugin dev
 ## Upgrading from `bb-plugin-dashboard`
 
 This plugin was previously called `dashboard` and its CLI was `bb dashboard`.
-The panel, data, and layout are unchanged — the id is now `usage` and the
-command is `bb usage`. If you installed the old one from a path, remove it
+The panel, data, and layout are unchanged — the id is now `provider-usage` and
+the command is `bb usage`. If you installed the old one from a path, remove it
 before installing this one:
 
 ```bash
 bb plugin remove dashboard
-bb plugin install usage
+bb plugin install provider-usage
 ```
+
+To keep your token history, copy the old plugin's database across before
+installing:
+
+```bash
+cp ~/.bb/plugins/dashboard/data.db ~/.bb/plugins/provider-usage/data.db
+```
+
+It is not the same plugin as the marketplace's `usage`, `usage-page`, or
+`usage-tracker` entries, which track token spend and estimated API cost. This
+one leads with **remaining plan quota and reset windows**, and reads token
+volume off local transcripts rather than pricing it.
 
 ## Licence
 
