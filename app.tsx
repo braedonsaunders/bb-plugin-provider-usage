@@ -53,6 +53,7 @@ const PROVIDER_SWATCH: Record<string, string> = {
   codex: "var(--primary)",
   "claude-code": "var(--success)",
   cursor: "var(--chart-3, #f59e0b)",
+  opencode: "var(--chart-4, #2563eb)",
 };
 
 function providerSwatch(id: string): string {

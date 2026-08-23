@@ -19,8 +19,9 @@ relative.
 
 **Token usage.** A 7 / 30 / 90-day multi-series chart of real token volume read
 straight off local transcripts — Codex (`~/.codex`, or `$CODEX_HOME`), Claude
-Code (`~/.claude`, or `$CLAUDE_CONFIG_DIR`), and Cursor's ACP session stores —
-broken out into total, input, output, and cached, per provider.
+Code (`~/.claude`, or `$CLAUDE_CONFIG_DIR`), Cursor's ACP session stores, and
+opencode (`~/.local/share/opencode`, or `$XDG_DATA_HOME/opencode`) — broken out
+into total, input, output, and cached, per provider.
 
 **Multi-machine.** If you have more than one host paired, a machine picker
 switches the whole view between them.
@@ -67,7 +68,7 @@ own.
 
 Token totals come from a background `token-scan` service that walks local
 transcript files, caches per-file results in the plugin's SQLite database, and
-re-syncs every 15 minutes. Only files whose size or mtime changed are re-read,
+re-syncs every 15 minutes. Only sources whose size or mtime changed are re-read,
 so a large history stays cheap. Nothing is uploaded anywhere.
 
 ## Develop

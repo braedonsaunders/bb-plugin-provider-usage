@@ -1,7 +1,7 @@
 export const TOKEN_WINDOWS = [7, 30, 90] as const;
 export type TokenWindowDays = (typeof TOKEN_WINDOWS)[number];
 
-export const TOKEN_PROVIDERS = ["codex", "claude-code", "cursor"] as const;
+export const TOKEN_PROVIDERS = ["codex", "claude-code", "cursor", "opencode"] as const;
 export type TokenProviderId = (typeof TOKEN_PROVIDERS)[number];
 
 export interface TokenBucket {
@@ -110,6 +110,8 @@ export function providerDisplayName(id: string): string {
       return "Claude Code";
     case "cursor":
       return "Cursor";
+    case "opencode":
+      return "opencode";
     default:
       return id;
   }

@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { mergeCursorDaily, scanCursorStores } from "./cursor-scan";
+import { mergeOpencodeDaily, scanOpencodeStores } from "./opencode-scan";
 import {
   addBucket,
   dayKey,
@@ -196,6 +197,7 @@ async function parseFile(
 export async function scanTokenFiles(options?: {
   nowMs?: number;
   includeCursor?: boolean;
+  includeOpencode?: boolean;
   cached?: Map<string, { mtimeMs: number; size: number; daily: Record<string, TokenBucket> }>;
 }): Promise<{
   files: FileScanResult[];
@@ -276,6 +278,20 @@ export async function scanTokenFiles(options?: {
       files.push(file);
     }
     mergeCursorDaily(daily, cursorFiles);
+  }
+
+  const opencodeFiles =
+    options?.includeOpencode === false ? [] : scanOpencodeStores({ cached, nowMs });
+  if (opencodeFiles.length > 0) {
+    sources.push("opencode");
+    for (const file of opencodeFiles) {
+      const prior = cached.get(file.path);
+      if (!prior || prior.mtimeMs !== file.mtimeMs || prior.size !== file.size) {
+        changedFiles += 1;
+      }
+      files.push(file);
+    }
+    mergeOpencodeDaily(daily, opencodeFiles);
   }
 
   return { files, changedFiles, sources, daily };

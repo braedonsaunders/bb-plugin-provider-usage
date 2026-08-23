@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-provider-usage",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Subscription limits, remaining quota, reset windows, and global token usage across every provider you are signed in to.",
   "license": "MIT",
   "author": "Braedon Saunders",
@@ -45,7 +45,9 @@
     },
     "server": "./server.ts",
     "app": "./app.tsx",
-    "skills": ["skills"]
+    "skills": [
+      "skills"
+    ]
   },
   "dependencies": {
     "@hugeicons/core-free-icons": "^4.1.3",
