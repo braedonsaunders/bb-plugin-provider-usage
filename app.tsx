@@ -28,6 +28,8 @@ import {
   type TokenSnapshot,
   type TokenWindowDays,
 } from "./lib/tokens";
+import { SERIES_STYLESHEET, providerColor } from "./lib/series-palette";
+import { LiveThroughputSection } from "./components/live-throughput";
 
 const REFRESH_MS = 60_000;
 
@@ -43,43 +45,28 @@ function toneFill(tone: RemainingTone): string {
   return "bg-success";
 }
 
+/**
+ * The meter's unfilled track is a light step of the fill's own colour, so the
+ * whole bar carries the state rather than only the part that is left.
+ */
+function toneTrack(tone: RemainingTone): string {
+  if (tone === "critical") return "bg-destructive/15";
+  if (tone === "warn") return "bg-primary/15";
+  return "bg-success/15";
+}
+
 function toneRing(tone: RemainingTone): string {
   if (tone === "critical") return "stroke-destructive";
   if (tone === "warn") return "stroke-primary";
   return "stroke-success";
 }
 
-const PROVIDER_SWATCH: Record<string, string> = {
-  codex: "var(--primary)",
-  "claude-code": "var(--success)",
-  cursor: "var(--chart-3, #f59e0b)",
-  opencode: "var(--chart-4, #2563eb)",
-};
-
 /**
- * Providers arrive from bb's own event stream as well as the built-in
- * scanners, so the chart cannot assume it knows every id. An unrecognised one
- * gets a stable hue derived from its id rather than the same grey as every
- * other unknown, which would make two of them indistinguishable.
+ * Both charts read the same seat-per-provider palette, so a provider is the
+ * same colour in the live section and in the daily one. See
+ * `lib/series-palette.ts` for how the slots were chosen and checked.
  */
-const FALLBACK_SWATCHES = [
-  "var(--chart-5, #8b5cf6)",
-  "var(--chart-2, #14b8a6)",
-  "var(--chart-1, #ec4899)",
-  "#0ea5e9",
-  "#84cc16",
-  "#f43f5e",
-];
-
-function providerSwatch(id: string): string {
-  const known = PROVIDER_SWATCH[id];
-  if (known) return known;
-  let hash = 0;
-  for (let i = 0; i < id.length; i += 1) {
-    hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
-  }
-  return FALLBACK_SWATCHES[hash % FALLBACK_SWATCHES.length]!;
-}
+const providerSwatch = providerColor;
 
 function useDashboard(hostId: string | null) {
   const rpc = useRpc<typeof rpcContract>();
@@ -331,11 +318,12 @@ function TokenUsageSection() {
 
   return (
     <Card className="shadow-none">
+      <style>{SERIES_STYLESHEET}</style>
       <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0 p-5 pb-3">
         <div>
           <CardTitle className="text-base">Token usage</CardTitle>
           <p className="mt-1 text-xs text-muted-foreground">
-            Input + output across Codex, Claude Code, and Cursor sessions on this machine
+            Tracked token volume, including cached input, across sessions on this machine
           </p>
         </div>
         <div className="flex rounded-md border border-border p-0.5">
@@ -372,7 +360,7 @@ function TokenUsageSection() {
               <Metric
                 label="Total"
                 value={formatTokenCount(data.totals.tokens)}
-                hint={`${data.totals.turns.toLocaleString()} turns · excluding cache`}
+                hint={`${data.totals.turns.toLocaleString()} turns · cache included`}
               />
               <Metric
                 label="Input"
@@ -459,6 +447,12 @@ function Gauge({
   );
 }
 
+/**
+ * Every meter on this page counts the same way: down. The ring, this bar, and
+ * the number beside it all show what is LEFT, which is the way each provider
+ * states its own limits — a bar that filled as you spent would say the
+ * opposite of the "% left" printed next to it.
+ */
 function UsageBar({ window }: { window: UsageWindow }) {
   const tone = remainingTone(window.remainingPercent);
   return (
@@ -472,19 +466,29 @@ function UsageBar({ window }: { window: UsageWindow }) {
               : "No reset time reported"}
           </p>
         </div>
-        <div className="text-right">
-          <p className={cn("text-sm font-semibold tabular-nums", toneText(tone))}>
-            {formatPercent(window.remainingPercent)} left
-          </p>
-          <p className="text-xs tabular-nums text-muted-foreground">
-            {formatPercent(window.usedPercent)} used
-          </p>
-        </div>
+        <p
+          className={cn(
+            "shrink-0 text-sm font-semibold tabular-nums",
+            toneText(tone),
+          )}
+        >
+          {formatPercent(window.remainingPercent)} left
+        </p>
       </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+      <div
+        className={cn("h-1.5 overflow-hidden rounded-full", toneTrack(tone))}
+        role="meter"
+        aria-valuenow={Math.round(window.remainingPercent)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label={`${window.label} remaining`}
+      >
         <div
-          className={cn("h-full rounded-full transition-all duration-500", toneFill(tone))}
-          style={{ width: `${window.usedPercent}%` }}
+          className={cn(
+            "h-full rounded-full transition-all duration-500",
+            toneFill(tone),
+          )}
+          style={{ width: `${window.remainingPercent}%` }}
         />
       </div>
     </div>
@@ -589,126 +593,95 @@ function DashboardBody({
 
   if (!data) return null;
 
-  const { totals } = data;
-  const tightestTone = totals.tightest
-    ? remainingTone(totals.tightest.remainingPercent)
-    : undefined;
-
   return (
     <div className="space-y-5">
       {error ? (
         <p className="text-xs text-destructive">Refresh failed: {error}</p>
       ) : null}
 
+      <LiveThroughputSection />
+
       <TokenUsageSection />
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        {data.providers.map((provider) => {
-          const hero = provider.windows[0];
-          return (
-            <Card key={provider.id} className="shadow-none">
-              <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0 p-5 pb-4">
-                <div className="flex min-w-0 items-center gap-3">
-                  <ProviderMark name={provider.displayName} logoUrl={provider.logoUrl} />
-                  <div className="min-w-0">
-                    <CardTitle className="text-base">{provider.displayName}</CardTitle>
+      <Card className="shadow-none">
+        <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0 p-5 pb-4">
+          <div>
+            <CardTitle className="text-base">Provider limits</CardTitle>
+            <p className="mt-1 text-xs text-muted-foreground">
+              What is left of each plan window, and when it comes back
+            </p>
+          </div>
+          <button
+            type="button"
+            title={
+              refreshing
+                ? "Refreshing…"
+                : `Updated ${formatFetchedAt(data.fetchedAt)}`
+            }
+            className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            onClick={() => void reload()}
+          >
+            <HugeiconsIcon
+              icon={RefreshIcon}
+              className={cn("size-3.5", refreshing && "animate-spin")}
+            />
+            Refresh
+          </button>
+        </CardHeader>
+        <CardContent className="divide-y divide-border p-0">
+          {data.providers.map((provider) => {
+            const hero = provider.windows[0];
+            return (
+              <div
+                key={provider.id}
+                className="flex flex-col gap-4 p-5 md:flex-row md:items-start md:gap-6"
+              >
+                <div className="flex min-w-0 shrink-0 items-center gap-3 md:w-60">
+                  <ProviderMark
+                    name={provider.displayName}
+                    logoUrl={provider.logoUrl}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium">
+                      {provider.displayName}
+                    </p>
                     <p className="truncate text-xs text-muted-foreground">
-                      {[provider.planLabel, provider.accountEmail, statusLabel(provider.status)]
+                      {[
+                        provider.planLabel,
+                        provider.accountEmail,
+                        statusLabel(provider.status),
+                      ]
                         .filter(Boolean)
                         .join(" · ")}
                     </p>
                   </div>
+                  {hero ? (
+                    <Gauge remainingPercent={hero.remainingPercent} size={56} />
+                  ) : null}
                 </div>
-                {hero ? <Gauge remainingPercent={hero.remainingPercent} /> : null}
-              </CardHeader>
-              <CardContent className="space-y-4 p-5 pt-0">
-                {provider.status === "ok" && provider.windows.length > 0 ? (
-                  provider.windows.map((window) => (
-                    <UsageBar key={window.label} window={window} />
-                  ))
-                ) : (
-                  <p className="text-sm text-muted-foreground">
-                    {provider.status === "ok"
-                      ? "Signed in, but this provider did not report a subscription window."
-                      : provider.status === "unauthenticated" ||
-                          provider.status === "expired"
-                        ? "Sign in under Settings → Providers to see remaining quota and reset times."
-                        : provider.status === "not_installed"
-                          ? "Install this provider on the selected machine to track its limits."
-                          : provider.message ?? "Usage is unavailable right now."}
-                  </p>
-                )}
-              </CardContent>
-            </Card>
-          );
-        })}
-      </div>
-
-      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <Metric
-          label="Signed in"
-          value={`${totals.okProviders}/${totals.trackedProviders}`}
-          hint={`${totals.windowCount} limit window${totals.windowCount === 1 ? "" : "s"}`}
-        />
-        <Metric
-          label="Remaining"
-          value={
-            totals.cumulativeRemainingPercent === null
-              ? "—"
-              : formatPercent(totals.cumulativeRemainingPercent)
-          }
-          hint={
-            totals.cumulativeRemainingPercent === null
-              ? "No live windows"
-              : `Across ${totals.okProviders} signed-in provider${totals.okProviders === 1 ? "" : "s"}`
-          }
-          tone={
-            totals.cumulativeRemainingPercent === null
-              ? undefined
-              : remainingTone(totals.cumulativeRemainingPercent)
-          }
-        />
-        <Metric
-          label="Tightest"
-          value={
-            totals.tightest
-              ? formatPercent(totals.tightest.remainingPercent)
-              : "—"
-          }
-          hint={
-            totals.tightest
-              ? `${totals.tightest.providerName} · ${totals.tightest.windowLabel}`
-              : "No live windows"
-          }
-          tone={tightestTone}
-        />
-        <Metric
-          label="Next reset"
-          value={
-            totals.nextResetAt ? formatResetRelative(totals.nextResetAt) : "—"
-          }
-          hint={
-            totals.nextResetAt
-              ? formatResetAbsolute(totals.nextResetAt)
-              : "No reset reported"
-          }
-        />
-      </div>
-
-      <p className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
-        <span>
-          Subscription windows from each provider
-          {refreshing ? " · refreshing…" : ` · updated ${formatFetchedAt(data.fetchedAt)}`}
-        </span>
-        <button
-          type="button"
-          className="inline-flex items-center gap-1 text-foreground hover:underline"
-          onClick={() => void reload()}
-        >
-          <HugeiconsIcon icon={RefreshIcon} className={cn("size-3.5", refreshing && "animate-spin")} />
-          Refresh
-        </button>
-      </p>
+                <div className="min-w-0 flex-1 space-y-4">
+                  {provider.status === "ok" && provider.windows.length > 0 ? (
+                    provider.windows.map((window) => (
+                      <UsageBar key={window.label} window={window} />
+                    ))
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      {provider.status === "ok"
+                        ? "Signed in, but this provider did not report a subscription window."
+                        : provider.status === "unauthenticated" ||
+                            provider.status === "expired"
+                          ? "Sign in under Settings → Providers to see remaining quota and reset times."
+                          : provider.status === "not_installed"
+                            ? "Install this provider on the selected machine to track its limits."
+                            : provider.message ?? "Usage is unavailable right now."}
+                    </p>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </CardContent>
+      </Card>
     </div>
   );
 }

@@ -351,24 +351,21 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
     "",
     "Totals",
     `  Providers        ${snapshot.totals.okProviders} signed in / ${snapshot.totals.trackedProviders} tracked`,
-    `  Average used     ${
-      snapshot.totals.averageUsedPercent === null
-        ? "—"
-        : formatPercent(snapshot.totals.averageUsedPercent)
-    }`,
+    // Everything below counts down, matching the panel's meters and the way
+    // each provider states its own limits.
     `  Remaining        ${
       snapshot.totals.cumulativeRemainingPercent === null
         ? "—"
-        : formatPercent(snapshot.totals.cumulativeRemainingPercent)
+        : `${formatPercent(snapshot.totals.cumulativeRemainingPercent)} left`
     }`,
     `  Window average   ${
       snapshot.totals.averageRemainingPercent === null
         ? "—"
-        : formatPercent(snapshot.totals.averageRemainingPercent)
+        : `${formatPercent(snapshot.totals.averageRemainingPercent)} left`
     }`,
     `  Tightest         ${
       snapshot.totals.tightest
-        ? `${snapshot.totals.tightest.providerName} ${snapshot.totals.tightest.windowLabel} · ${formatPercent(snapshot.totals.tightest.remainingPercent)} remaining`
+        ? `${snapshot.totals.tightest.providerName} ${snapshot.totals.tightest.windowLabel} · ${formatPercent(snapshot.totals.tightest.remainingPercent)} left`
         : "—"
     }`,
     `  Next reset       ${
@@ -400,7 +397,7 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
         ? ` · resets ${formatResetAbsolute(window.resetsAt)} (in ${formatResetRelative(window.resetsAt)})`
         : "";
       lines.push(
-        `  ${window.label.padEnd(18)} ${formatPercent(window.usedPercent)} used · ${formatPercent(window.remainingPercent)} remaining${cost}${reset}`,
+        `  ${window.label.padEnd(18)} ${formatPercent(window.remainingPercent)} left · ${formatPercent(window.usedPercent)} used${cost}${reset}`,
       );
     }
   }

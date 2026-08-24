@@ -1,25 +1,31 @@
 # Provider Usage
 
-A BB panel for **how much of your plan is left** and **how many tokens you are
-actually burning** — across every provider you are signed in to, on every
-machine BB knows about.
+A BB panel for **what you are burning right now**, **how much of your plan is
+left**, and **how many tokens you have spent** — across every provider you are
+signed in to, on every machine BB knows about.
 
 <!-- screenshot: docs/panel.png -->
 
 ## What it shows
 
-**Subscription windows.** One card per signed-in provider with its plan, each
-rate-limit window (5-hour, weekly, monthly — whatever the provider reports),
-percent used, percent left, and when it resets. Windows are colour-toned so a
-nearly-exhausted one is obvious at a glance.
+**Live throughput.** A 15-minute chart of tokens as they are reported, binned
+per 10 seconds and stacked by provider, with the current rate over the trailing
+60 seconds, the best rate seen in the window, and the threads doing the work. It
+updates every couple of seconds while a turn is running and settles when the
+machine goes quiet.
 
-**Headline metrics.** Providers signed in, cumulative remaining across all of
-them, the single tightest window right now, and the next reset — absolute and
-relative.
+**Provider limits.** One pane, one row per signed-in provider: its plan, each
+rate-limit window (5-hour, weekly, monthly — whatever the provider reports), how
+much is left, and when it comes back. Every meter counts **down** — the ring,
+the bar, and the number all show what remains, the way each provider states its
+own limits.
 
 **Token usage, for every provider.** A 7 / 30 / 90-day multi-series chart of
-real token volume, broken out into total, input, output, and cached, per
-provider. It reads from two tiers:
+real token volume, broken out into total, uncached input, output, and cached,
+per provider. Total follows the provider's canonical count where one is
+available and includes cached input; the cached field is also retained as a
+breakdown. Cursor's ACP stores do not include token counters, so its series is
+estimated from the recorded conversation text. The data reads from two tiers:
 
 - **Transcript scanners** for the agents that keep detailed local records —
   Codex (`~/.codex`, or `$CODEX_HOME`), Claude Code (`~/.claude`, or
@@ -65,6 +71,7 @@ Open **Usage** in the left sidebar.
 ```bash
 bb usage                          # remaining quota, plans, reset windows
 bb usage --json                   # same, machine-readable
+bb usage live                     # what is being burned right now, by thread
 bb usage tokens --days 30         # global token volume across providers
 bb usage --machine <id-or-name>   # read another paired host
 ```
@@ -89,8 +96,33 @@ total rather than the turn's, so consecutive events are differenced; a total
 that goes backwards means the thread was compacted or restarted upstream and is
 read as a fresh total rather than a negative one.
 
-A caveat worth stating plainly: the second tier only sees what a provider
-actually reports. Providers that never emit `thread/tokenUsage/updated` will
+Live throughput is a separate, deliberately different source: a `throughput-scan`
+service that follows `thread/tokenUsage/updated` for **every** provider, polling
+every two seconds while a thread is working and every ten when none is. Because
+it is the only source there, no provider is excluded and nothing is double
+counted — the trade is that work run outside BB, such as an agent CLI in a bare
+terminal, reports no events and does not appear.
+
+Attribution is the subtle part. Those events carry the thread's *running* total,
+so consecutive events are differenced. The first event seen for a thread has
+nothing to difference against, and providers report it very differently: BB's
+Claude Code bridge has been seen emitting a single event whose running total is
+98.7M and whose `last` is 55.9M — usage since the session resumed, hours of it,
+not one step. Charting either figure raw drops tens of millions of tokens onto
+one instant. So a thread's first event is charted only when the thread itself is
+younger than the window, because then its whole history is inside the window by
+definition; otherwise it becomes the baseline and every event after it
+differences correctly. The cost is one uncharted turn per thread when the
+service starts.
+
+The two charts share one palette, seated per provider rather than per rank, so a
+provider is the same colour in both and keeps that colour as other series come
+and go. The slots are checked rather than eyeballed: each sits in its mode's
+lightness band, clears the chroma floor, holds 3:1 against the surface, and keeps
+neighbouring slots apart under simulated protanopia and deuteranopia.
+
+A caveat worth stating plainly: the daily chart's second tier only sees what a
+provider actually reports. Providers that never emit `thread/tokenUsage/updated` will
 show subscription windows but no token series, and some agents (Factory Droid,
 Hermes) keep no usable per-turn token record on disk at all.
 

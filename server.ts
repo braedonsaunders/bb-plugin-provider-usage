@@ -24,6 +24,15 @@ import {
   type TokenSnapshot,
   type TokenWindowDays,
 } from "./lib/tokens";
+import {
+  createThroughputRecorder,
+  formatThroughputText,
+  type ThroughputSnapshot,
+} from "./lib/throughput";
+import {
+  createThroughputScanner,
+  type ThroughputScanThread,
+} from "./lib/throughput-scan";
 
 const usageWindowSchema = z.object({
   label: z.string(),
@@ -128,6 +137,50 @@ const tokenSnapshotSchema = z.object({
   ),
 });
 
+const throughputSnapshotSchema = z.object({
+  sampledAt: z.string(),
+  nowMs: z.number(),
+  windowMs: z.number(),
+  binMs: z.number(),
+  rateWindowMs: z.number(),
+  tokensPerMinute: z.number(),
+  peakTokensPerMinute: z.number(),
+  peakAtMs: z.number().nullable(),
+  windowTotals: tokenBucketSchema,
+  activeThreads: z.number().int(),
+  trackedThreads: z.number().int(),
+  live: z.boolean(),
+  providers: z.array(
+    z.object({
+      id: z.string(),
+      displayName: z.string(),
+      tokens: z.number(),
+      tokensPerMinute: z.number(),
+      sharePercent: z.number(),
+      lastAtMs: z.number().nullable(),
+    }),
+  ),
+  series: z.array(
+    z.object({
+      atMs: z.number(),
+      total: z.number(),
+      byProvider: z.record(z.string(), z.number()),
+    }),
+  ),
+  threads: z.array(
+    z.object({
+      threadId: z.string(),
+      title: z.string(),
+      providerId: z.string(),
+      providerName: z.string(),
+      status: z.string(),
+      tokens: z.number(),
+      tokensPerMinute: z.number(),
+      lastAtMs: z.number(),
+    }),
+  ),
+});
+
 export const rpcContract = defineRpcContract({
   getDashboard: {
     input: z.object({ hostId: z.string().nullable() }).strict(),
@@ -141,6 +194,10 @@ export const rpcContract = defineRpcContract({
       })
       .strict(),
     output: tokenSnapshotSchema,
+  },
+  getThroughput: {
+    input: z.null(),
+    output: throughputSnapshotSchema,
   },
 });
 
@@ -192,12 +249,14 @@ function parseCliArgs(argv: string[]): {
   hostId: string | null;
   help: boolean;
   tokens: boolean;
+  live: boolean;
   days: TokenWindowDays;
   force: boolean;
 } {
   let json = false;
   let help = false;
   let tokens = false;
+  let live = false;
   let force = false;
   let days: TokenWindowDays = 30;
   let hostId: string | null = null;
@@ -207,6 +266,7 @@ function parseCliArgs(argv: string[]): {
     else if (arg === "-h" || arg === "--help") help = true;
     else if (arg === "--force") force = true;
     else if (arg === "tokens") tokens = true;
+    else if (arg === "live") live = true;
     else if (arg === "--days") {
       const next = Number(argv[i + 1]);
       if (isTokenWindow(next)) days = next;
@@ -216,7 +276,7 @@ function parseCliArgs(argv: string[]): {
       i += 1;
     }
   }
-  return { json, hostId, help, tokens, days, force };
+  return { json, hostId, help, tokens, live, days, force };
 }
 
 type TokenCacheRow = {
@@ -225,6 +285,18 @@ type TokenCacheRow = {
   size: number;
   daily_json: string;
 };
+
+type PersistedTokenFile = {
+  version: 2;
+  daily: Record<string, TokenBucket>;
+  keyedEvents?: FileScanResult["keyedEvents"];
+};
+
+function isPersistedTokenFile(value: unknown): value is PersistedTokenFile {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return row.version === 2 && !!row.daily && typeof row.daily === "object";
+}
 
 function createTokenStore(bb: BbPluginApi) {
   const db = bb.storage.database();
@@ -240,11 +312,22 @@ function createTokenStore(bb: BbPluginApi) {
       value TEXT NOT NULL
     )`,
     `DELETE FROM token_file_cache`,
+    // Token accounting v2: Total now follows each provider's canonical total
+    // (cache included, reasoning not double-counted). Reparse persisted files.
+    `DELETE FROM token_file_cache`,
+    // Identity-aware transcript parsing stores Claude message ids so the same
+    // response is deduplicated across fragments and copied subagent files.
+    `DELETE FROM token_file_cache`,
   ]);
 
   const loadCache = new Map<
     string,
-    { mtimeMs: number; size: number; daily: Record<string, TokenBucket> }
+    {
+      mtimeMs: number;
+      size: number;
+      daily: Record<string, TokenBucket>;
+      keyedEvents?: FileScanResult["keyedEvents"];
+    }
   >();
   for (const row of db
     .prepare(
@@ -252,10 +335,19 @@ function createTokenStore(bb: BbPluginApi) {
     )
     .all() as TokenCacheRow[]) {
     try {
+      const parsed = JSON.parse(row.daily_json) as
+        | PersistedTokenFile
+        | Record<string, TokenBucket>;
+      const persisted: PersistedTokenFile = isPersistedTokenFile(parsed)
+        ? parsed
+        : { version: 2, daily: parsed as Record<string, TokenBucket> };
       loadCache.set(row.path, {
         mtimeMs: row.mtime_ms,
         size: row.size,
-        daily: JSON.parse(row.daily_json) as Record<string, TokenBucket>,
+        daily: persisted.daily,
+        ...(persisted.keyedEvents
+          ? { keyedEvents: persisted.keyedEvents }
+          : {}),
       });
     } catch {
       continue;
@@ -290,12 +382,17 @@ function createTokenStore(bb: BbPluginApi) {
           file.path,
           file.mtimeMs,
           file.size,
-          JSON.stringify(file.daily),
+          JSON.stringify({
+            version: 2,
+            daily: file.daily,
+            ...(file.keyedEvents ? { keyedEvents: file.keyedEvents } : {}),
+          } satisfies PersistedTokenFile),
         );
         loadCache.set(file.path, {
           mtimeMs: file.mtimeMs,
           size: file.size,
           daily: file.daily,
+          ...(file.keyedEvents ? { keyedEvents: file.keyedEvents } : {}),
         });
       }
     });
@@ -436,9 +533,82 @@ function createTokenStore(bb: BbPluginApi) {
   return { get, sync };
 }
 
+/** Poll cadence while at least one thread is working, and while none are. */
+const THROUGHPUT_BUSY_MS = 2_000;
+const THROUGHPUT_QUIET_MS = 10_000;
+
+function createThroughputStore(bb: BbPluginApi) {
+  const recorder = createThroughputRecorder();
+  let tracked = 0;
+  let working = 0;
+
+  const scanner = createThroughputScanner(recorder, {
+    onError: (error) =>
+      bb.log.warn(
+        `throughput scan: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    listThreads: async () => {
+      const rows = await bb.sdk.threads.list({ includeHidden: true });
+      return rows.map(
+        (row): ThroughputScanThread => ({
+          id: row.id,
+          providerId: row.providerId,
+          title: row.title ?? row.titleFallback ?? null,
+          status: row.status,
+          updatedAt: row.updatedAt,
+          createdAt: row.createdAt,
+        }),
+      );
+    },
+    listEvents: async ({ threadId, afterSeq, order, limit }) => {
+      const rows = await bb.sdk.threads.events.list({
+        threadId,
+        types: ["thread/tokenUsage/updated"],
+        order,
+        limit: String(limit),
+        ...(afterSeq === undefined ? {} : { afterSeq: String(afterSeq) }),
+      });
+      const events: BbUsageEvent[] = [];
+      for (const row of rows) {
+        if (row.type !== "thread/tokenUsage/updated") continue;
+        const usage = row.data.tokenUsage;
+        const total = usage?.total as BbUsageTotal | undefined;
+        if (!total) continue;
+        const last = usage?.last as BbUsageTotal | undefined;
+        events.push({
+          seq: row.seq,
+          createdAt: row.createdAt,
+          total,
+          ...(last ? { last } : {}),
+        });
+      }
+      return events;
+    },
+  });
+
+  const snapshot = (nowMs = Date.now()): ThroughputSnapshot =>
+    recorder.snapshot(nowMs, tracked);
+
+  const refresh = async (): Promise<ThroughputSnapshot> => {
+    const result = await scanner.refresh();
+    tracked = result.tracked;
+    working = result.working;
+    return snapshot();
+  };
+
+  return {
+    snapshot,
+    refresh,
+    markDirty: (threadId: string) => scanner.markDirty(threadId),
+    /** Poll fast while work is in flight, slowly when the machine is quiet. */
+    intervalMs: () => (working > 0 ? THROUGHPUT_BUSY_MS : THROUGHPUT_QUIET_MS),
+  };
+}
+
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
   const tokens = createTokenStore(bb);
+  const throughput = createThroughputStore(bb);
 
   bb.rpc.register(rpcContract, {
     async getDashboard({ hostId }) {
@@ -446,6 +616,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async getTokens({ days, force }) {
       return tokens.get(days, force === true);
+    },
+    async getThroughput() {
+      return throughput.snapshot();
     },
   });
 
@@ -484,6 +657,59 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  bb.background.service("throughput-scan", {
+    async start(signal) {
+      // A thread row changes the moment its turn moves, which is the earliest
+      // signal available that new usage events may exist — well before the
+      // next poll would have come round.
+      let unsubscribe: (() => void) | null = null;
+      try {
+        unsubscribe = bb.sdk.subscribe({
+          event: "thread:changed",
+          callback: (event) => {
+            if (event.id) throughput.markDirty(event.id);
+          },
+        });
+      } catch (error) {
+        bb.log.warn(
+          `throughput thread subscription unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      signal.addEventListener("abort", () => unsubscribe?.(), { once: true });
+
+      let previous = "";
+      while (!signal.aborted) {
+        try {
+          const snapshot = await throughput.refresh();
+          // Publish only on change: an idle machine should not wake every
+          // connected client every two seconds.
+          const signature = `${snapshot.windowTotals.tokens}:${snapshot.windowTotals.turns}:${snapshot.activeThreads}`;
+          if (signature !== previous) {
+            previous = signature;
+            bb.realtime.publish("throughput", { at: snapshot.nowMs });
+          }
+        } catch (error) {
+          bb.log.warn(
+            `throughput refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (signal.aborted) break;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, throughput.intervalMs());
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      }
+      unsubscribe?.();
+    },
+  });
+
   bb.cli.register({
     name: "usage",
     summary: "Show provider subscription usage, remaining limits, and token totals",
@@ -498,16 +724,29 @@ export default async function plugin(bb: BbPluginApi) {
         summary: "Print global token usage across providers",
         usage: "bb usage tokens [--days 7|30|90] [--force] [--json]",
       },
+      {
+        name: "live",
+        summary: "Print live token throughput across running threads",
+        usage: "bb usage live [--json]",
+      },
     ],
     async run(argv) {
-      const { json, hostId, help, tokens: tokensOnly, days, force } =
+      const { json, hostId, help, tokens: tokensOnly, live, days, force } =
         parseCliArgs(argv);
       if (help) {
         return {
           exitCode: 0,
           stdout:
-            "Usage: bb usage [show|tokens] [--days 7|30|90] [--machine <id-or-name>] [--force] [--json]\n",
+            "Usage: bb usage [show|tokens|live] [--days 7|30|90] [--machine <id-or-name>] [--force] [--json]\n",
         };
+      }
+
+      if (live) {
+        const snapshot = await throughput.refresh();
+        if (json) {
+          return { exitCode: 0, stdout: `${JSON.stringify(snapshot, null, 2)}\n` };
+        }
+        return { exitCode: 0, stdout: formatThroughputText(snapshot) };
       }
 
       if (tokensOnly) {

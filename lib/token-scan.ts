@@ -19,6 +19,12 @@ export interface FileScanResult {
   mtimeMs: number;
   size: number;
   daily: Record<string, TokenBucket>;
+  keyedEvents?: Record<string, TokenEvent>;
+}
+
+export interface TokenEvent {
+  atMs: number;
+  bucket: TokenBucket;
 }
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
@@ -29,6 +35,7 @@ function asNumber(value: unknown): number {
 }
 
 function usageBucket(parts: {
+  total?: unknown;
   input?: unknown;
   output?: unknown;
   cached?: unknown;
@@ -42,7 +49,12 @@ function usageBucket(parts: {
   const input = parts.inputIncludesCached
     ? Math.max(0, rawInput - asNumber(parts.cached))
     : rawInput;
-  const tokens = input + output + reasoning;
+  // Prefer the provider's canonical total. In Codex, cached input is already
+  // part of input and reasoning is already part of output. Claude does not
+  // report a total, so its total is the sum of its disjoint usage fields.
+  const reportedTotal = asNumber(parts.total);
+  const tokens =
+    reportedTotal > 0 ? reportedTotal : input + cached + output + reasoning;
   if (tokens <= 0 && cached <= 0) return null;
   return { tokens, input, output, cached, reasoning, turns: 1 };
 }
@@ -77,6 +89,7 @@ function readUsageObject(
   if (!value || typeof value !== "object") return null;
   const row = value as Record<string, unknown>;
   return usageBucket({
+    total: row.total_tokens ?? row.totalTokens,
     input: row.input_tokens ?? row.inputTokens,
     output: row.output_tokens ?? row.outputTokens,
     cached:
@@ -106,6 +119,28 @@ export function extractCodexBucket(record: unknown): {
   const bucket =
     readUsageObject(details.last_token_usage, true) ??
     readUsageObject(details.lastTokenUsage, true);
+  if (!bucket) return null;
+  const atMs = timestampMs(row.timestamp) || timestampMs(details.created_at);
+  return { atMs, bucket };
+}
+
+function extractCodexRunningBucket(record: unknown): {
+  atMs: number;
+  bucket: TokenBucket;
+} | null {
+  if (!record || typeof record !== "object") return null;
+  const row = record as Record<string, unknown>;
+  if (row.type !== "event_msg") return null;
+  const payload = row.payload;
+  if (!payload || typeof payload !== "object") return null;
+  const body = payload as Record<string, unknown>;
+  if (body.type !== "token_count") return null;
+  const info = body.info;
+  if (!info || typeof info !== "object") return null;
+  const details = info as Record<string, unknown>;
+  const bucket =
+    readUsageObject(details.total_token_usage, true) ??
+    readUsageObject(details.totalTokenUsage, true);
   if (!bucket) return null;
   const atMs = timestampMs(row.timestamp) || timestampMs(details.created_at);
   return { atMs, bucket };
@@ -160,14 +195,41 @@ export function tokenRoots(home = homedir(), env = process.env): {
   return roots;
 }
 
+function bucketDelta(current: TokenBucket, previous: TokenBucket): TokenBucket {
+  const delta = (next: number, prior: number) =>
+    next < prior ? Math.max(0, next) : next - prior;
+  return {
+    tokens: delta(current.tokens, previous.tokens),
+    input: delta(current.input, previous.input),
+    output: delta(current.output, previous.output),
+    cached: delta(current.cached, previous.cached),
+    reasoning: delta(current.reasoning, previous.reasoning),
+    turns: 1,
+  };
+}
+
+function claudeMessageId(record: unknown): string | null {
+  if (!record || typeof record !== "object") return null;
+  const message = (record as Record<string, unknown>).message;
+  if (!message || typeof message !== "object") return null;
+  const id = (message as Record<string, unknown>).id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
 async function parseFile(
   path: string,
   providerId: string,
-): Promise<Record<string, TokenBucket>> {
+): Promise<{
+  daily: Record<string, TokenBucket>;
+  keyedEvents?: Record<string, TokenEvent>;
+}> {
   const daily: Record<string, TokenBucket> = {};
+  const keyedEvents: Record<string, TokenEvent> | undefined =
+    providerId === "claude-code" ? {} : undefined;
   const stream = createReadStream(path, { encoding: "utf8" });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   let lastFingerprint = "";
+  let previousCodexTotal = emptyBucket();
   for await (const line of lines) {
     if (line.length < 20) continue;
     const interesting =
@@ -181,24 +243,57 @@ async function parseFile(
     } catch {
       continue;
     }
+    if (providerId === "codex") {
+      const running = extractCodexRunningBucket(record);
+      if (running) {
+        const bucket = bucketDelta(running.bucket, previousCodexTotal);
+        previousCodexTotal = running.bucket;
+        if (bucket.tokens > 0 || bucket.cached > 0) {
+          addDaily(daily, running.atMs, bucket);
+        }
+        continue;
+      }
+    }
+
     const hit =
       providerId === "codex"
         ? extractCodexBucket(record)
         : extractClaudeBucket(record);
     if (!hit) continue;
+    const messageId =
+      providerId === "claude-code" ? claudeMessageId(record) : null;
+    if (messageId && keyedEvents) {
+      const prior = keyedEvents[messageId];
+      if (
+        !prior ||
+        hit.bucket.tokens > prior.bucket.tokens ||
+        (hit.bucket.tokens === prior.bucket.tokens && hit.atMs >= prior.atMs)
+      ) {
+        keyedEvents[messageId] = hit;
+      }
+      continue;
+    }
     const fingerprint = `${hit.bucket.input}:${hit.bucket.output}:${hit.bucket.cached}:${hit.bucket.reasoning}`;
     if (fingerprint === lastFingerprint) continue;
     lastFingerprint = fingerprint;
     addDaily(daily, hit.atMs, hit.bucket);
   }
-  return daily;
+  return keyedEvents ? { daily, keyedEvents } : { daily };
 }
 
 export async function scanTokenFiles(options?: {
   nowMs?: number;
   includeCursor?: boolean;
   includeOpencode?: boolean;
-  cached?: Map<string, { mtimeMs: number; size: number; daily: Record<string, TokenBucket> }>;
+  cached?: Map<
+    string,
+    {
+      mtimeMs: number;
+      size: number;
+      daily: Record<string, TokenBucket>;
+      keyedEvents?: Record<string, TokenEvent>;
+    }
+  >;
 }): Promise<{
   files: FileScanResult[];
   changedFiles: number;
@@ -212,6 +307,7 @@ export async function scanTokenFiles(options?: {
   const sources: string[] = [];
   let changedFiles = 0;
   const daily: DailyProviderBuckets = {};
+  const claudeEvents = new Map<string, TokenEvent>();
 
   for (const source of tokenRoots()) {
     let listing: string[];
@@ -240,22 +336,50 @@ export async function scanTokenFiles(options?: {
         !prior ||
         prior.mtimeMs !== Math.round(info.mtimeMs) ||
         prior.size !== info.size;
-      const fileDaily = stale ? await parseFile(path, source.id) : prior.daily;
+      const parsed = stale
+        ? await parseFile(path, source.id)
+        : { daily: prior.daily, keyedEvents: prior.keyedEvents };
       if (stale) changedFiles += 1;
 
       files.push({
         path,
         mtimeMs: Math.round(info.mtimeMs),
         size: info.size,
-        daily: fileDaily,
+        daily: parsed.daily,
+        ...(parsed.keyedEvents ? { keyedEvents: parsed.keyedEvents } : {}),
       });
 
-      for (const [day, bucket] of Object.entries(fileDaily) as Array<
+      for (const [day, bucket] of Object.entries(parsed.daily) as Array<
         [string, TokenBucket]
       >) {
         const row = daily[day] ?? {};
         const current = row[source.id] ?? emptyBucket();
         addBucket(current, bucket);
+        row[source.id] = current;
+        daily[day] = row;
+      }
+
+      for (const [messageId, event] of Object.entries(
+        parsed.keyedEvents ?? {},
+      ) as Array<[string, TokenEvent]>) {
+        const priorEvent = claudeEvents.get(messageId);
+        if (
+          !priorEvent ||
+          event.bucket.tokens > priorEvent.bucket.tokens ||
+          (event.bucket.tokens === priorEvent.bucket.tokens &&
+            event.atMs >= priorEvent.atMs)
+        ) {
+          claudeEvents.set(messageId, event);
+        }
+      }
+    }
+
+    if (source.id === "claude-code") {
+      for (const event of claudeEvents.values()) {
+        const day = dayKey(event.atMs);
+        const row = daily[day] ?? {};
+        const current = row[source.id] ?? emptyBucket();
+        addBucket(current, event.bucket);
         row[source.id] = current;
         daily[day] = row;
       }

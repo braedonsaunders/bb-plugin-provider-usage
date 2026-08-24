@@ -5,7 +5,9 @@ export const TOKEN_PROVIDERS = ["codex", "claude-code", "cursor", "opencode"] as
 export type TokenProviderId = (typeof TOKEN_PROVIDERS)[number];
 
 export interface TokenBucket {
+  /** Provider-reported total, including cached input. */
   tokens: number;
+  /** Prompt/input tokens excluding the cached portion. */
   input: number;
   output: number;
   cached: number;
@@ -186,7 +188,7 @@ export function assembleTokenSnapshot(input: {
 export function formatTokenText(snapshot: TokenSnapshot): string {
   const lines = [
     `Token usage · last ${snapshot.days} days`,
-    `  Total             ${formatTokenCount(snapshot.totals.tokens)} (${snapshot.totals.turns} turns)`,
+    `  Total             ${formatTokenCount(snapshot.totals.tokens)} (${snapshot.totals.turns} turns, cache included)`,
     `  Input             ${formatTokenCount(snapshot.totals.input)}`,
     `  Output            ${formatTokenCount(snapshot.totals.output)}`,
     `  Cached            ${formatTokenCount(snapshot.totals.cached)}`,

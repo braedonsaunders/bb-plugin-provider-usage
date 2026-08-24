@@ -112,9 +112,8 @@ function asNumber(value: unknown): number {
 
 /**
  * opencode stores per-assistant-message counts where `input` already excludes
- * the cache and `total` already includes it, so the plugin's own convention
- * (`tokens` = input + output + reasoning, cache reported separately) comes
- * straight off the fields — never off `total`.
+ * the cache and `total` includes input, output, reasoning, and cache. Prefer
+ * that canonical total; the individual fields remain useful breakdowns.
  */
 export function extractOpencodeBucket(record: unknown): TokenBucket | null {
   if (!record || typeof record !== "object") return null;
@@ -132,7 +131,11 @@ export function extractOpencodeBucket(record: unknown): TokenBucket | null {
   const output = asNumber(counts.output);
   const reasoning = asNumber(counts.reasoning);
   const cached = asNumber(cache.read) + asNumber(cache.write);
-  const total = input + output + reasoning;
+  const reportedTotal = asNumber(counts.total);
+  const total =
+    reportedTotal > 0
+      ? reportedTotal
+      : input + output + reasoning + cached;
   if (total <= 0 && cached <= 0) return null;
   return { tokens: total, input, output, cached, reasoning, turns: 1 };
 }

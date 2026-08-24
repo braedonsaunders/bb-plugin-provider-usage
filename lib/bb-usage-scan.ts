@@ -32,6 +32,12 @@ export interface BbUsageEvent {
   seq: number;
   createdAt: number;
   total: BbUsageTotal;
+  /**
+   * The step's own usage, when the provider reports one. Where `total` is the
+   * thread's running sum, this is just the latest call — the only usable figure
+   * when there is no earlier total to difference against.
+   */
+  last?: BbUsageTotal;
 }
 
 /** bb namespaces every ACP agent as `acp-<agent>`; the chart wants the agent. */
@@ -60,7 +66,10 @@ export function bucketFromTotals(
   current: BbUsageTotal,
   previous: BbUsageTotal,
 ): TokenBucket | null {
-  const input = delta(asNumber(current.inputTokens), asNumber(previous.inputTokens));
+  const rawInput = delta(
+    asNumber(current.inputTokens),
+    asNumber(previous.inputTokens),
+  );
   const output = delta(asNumber(current.outputTokens), asNumber(previous.outputTokens));
   const reasoning = delta(
     asNumber(current.reasoningOutputTokens),
@@ -70,7 +79,15 @@ export function bucketFromTotals(
     asNumber(current.cachedInputTokens),
     asNumber(previous.cachedInputTokens),
   );
-  const tokens = input + output + reasoning;
+  const input = Math.max(0, rawInput - cached);
+  const reportedTotal = delta(
+    asNumber(current.totalTokens),
+    asNumber(previous.totalTokens),
+  );
+  // Provider-bridge totals already include cached input, and reasoning may be
+  // a subset of output. Fall back to the disjoint input/output fields only
+  // for providers that omit totalTokens.
+  const tokens = reportedTotal > 0 ? reportedTotal : rawInput + output;
   if (tokens <= 0 && cached <= 0) return null;
   return { tokens, input, output, cached, reasoning, turns: 1 };
 }
