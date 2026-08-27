@@ -23,8 +23,17 @@ registerHooks({
 const { extractCodexBucket, extractClaudeBucket } = await import(
   "../lib/token-scan.ts"
 );
-const { scanTokenFiles } = await import("../lib/token-scan.ts");
-const { extractOpencodeBucket } = await import("../lib/opencode-scan.ts");
+const { scanTokenFiles, seedDailyFromCache } = await import(
+  "../lib/token-scan.ts"
+);
+const {
+  createOpencodeLiveThroughputSource,
+  extractOpencodeBucket,
+  scanOpencodeStores,
+} = await import("../lib/opencode-scan.ts");
+const { estimateTokens, scanCursorStores } = await import(
+  "../lib/cursor-scan.ts"
+);
 const { bucketFromTotals } = await import("../lib/bb-usage-scan.ts");
 const { assembleTokenSnapshot, dayKey } = await import("../lib/tokens.ts");
 
@@ -100,6 +109,71 @@ test("opencode trusts its canonical total when breakdown fields disagree", () =>
     reasoning: 25,
     turns: 1,
   });
+});
+
+test("opencode live source reads completed usage for one BB session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "provider-usage-opencode-"));
+  const path = join(root, "opencode.db");
+  const Database = (await import("better-sqlite3")).default;
+  const db = new Database(path);
+  try {
+    db.exec(
+      "create table message (" +
+        "id text primary key, session_id text not null," +
+        "time_created integer not null, time_updated integer not null," +
+        "data text not null)",
+    );
+    const insert = db.prepare("insert into message values (?, ?, ?, ?, ?)");
+    insert.run(
+      "msg_pending",
+      "ses_bb",
+      1_000,
+      2_000,
+      JSON.stringify({
+        role: "assistant",
+        tokens: {
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+      }),
+    );
+    insert.run(
+      "msg_done",
+      "ses_bb",
+      3_000,
+      4_000,
+      JSON.stringify({
+        role: "assistant",
+        tokens: {
+          total: 900,
+          input: 100,
+          output: 50,
+          reasoning: 0,
+          cache: { read: 750, write: 0 },
+        },
+        time: { created: 3_000, completed: 4_500 },
+      }),
+    );
+  } finally {
+    db.close();
+  }
+
+  try {
+    const source = createOpencodeLiveThroughputSource({ paths: [path] });
+    const samples = await source.scan({
+      sessionIds: ["ses_bb"],
+      sinceMs: 0,
+    });
+    assert.equal(samples.length, 1);
+    assert.equal(samples[0].id, "msg_done");
+    assert.equal(samples[0].sessionId, "ses_bb");
+    assert.equal(samples[0].atMs, 4_500);
+    assert.equal(samples[0].bucket.tokens, 900);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("BB usage events difference the canonical running total", () => {
@@ -251,5 +325,165 @@ test("transcript scan uses Codex cumulative totals and Claude message ids", asyn
     if (priorClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = priorClaudeHome;
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("estimateTokens uses length/3.6 for ASCII and keeps CJK per-glyph", () => {
+  assert.equal(estimateTokens("abcd"), 2);
+  assert.equal(estimateTokens("你好"), 2);
+});
+
+test("seedDailyFromCache paints cursor/opencode without double-counting", () => {
+  const today = dayKey(Date.now());
+  const daily = {};
+  const sources = [];
+  const cached = new Map([
+    [
+      "/tmp/.cursor/acp-sessions/ses/store.db",
+      {
+        daily: {
+          [today]: {
+            tokens: 311,
+            input: 300,
+            output: 11,
+            cached: 0,
+            reasoning: 0,
+            turns: 1,
+          },
+        },
+      },
+    ],
+    [
+      "/tmp/.local/share/opencode/opencode.db",
+      {
+        daily: {
+          [today]: {
+            tokens: 4_800,
+            input: 4_000,
+            output: 800,
+            cached: 0,
+            reasoning: 0,
+            turns: 2,
+          },
+        },
+      },
+    ],
+  ]);
+
+  assert.equal(seedDailyFromCache(daily, sources, cached, "cursor"), 1);
+  assert.equal(seedDailyFromCache(daily, sources, cached, "opencode"), 1);
+  assert.deepEqual(sources, ["cursor", "opencode"]);
+  assert.equal(daily[today]?.cursor.tokens, 311);
+  assert.equal(daily[today]?.opencode.tokens, 4_800);
+
+  assert.equal(seedDailyFromCache(daily, sources, cached, "cursor"), 0);
+  assert.equal(daily[today]?.cursor.tokens, 311);
+});
+
+test("opencode store scan aggregates json_extract scalars by day", async () => {
+  const root = await mkdtemp(join(tmpdir(), "provider-usage-oc-scan-"));
+  const path = join(root, "opencode.db");
+  const Database = (await import("better-sqlite3")).default;
+  const db = new Database(path);
+  const created = Date.now() - 60_000;
+  try {
+    db.exec(
+      "create table message (" +
+        "id text primary key, session_id text not null," +
+        "time_created integer not null, time_updated integer not null," +
+        "data text not null)",
+    );
+    db.prepare("insert into message values (?, ?, ?, ?, ?)").run(
+      "msg_done",
+      "ses",
+      created,
+      created + 1,
+      JSON.stringify({
+        role: "assistant",
+        tokens: {
+          total: 900,
+          input: 100,
+          output: 50,
+          reasoning: 0,
+          cache: { read: 750, write: 0 },
+        },
+      }),
+    );
+  } finally {
+    db.close();
+  }
+
+  try {
+    const files = scanOpencodeStores({ paths: [path] });
+    assert.equal(files.length, 1);
+    const bucket = files[0].daily[dayKey(created)];
+    assert.equal(bucket?.tokens, 900);
+    assert.equal(bucket?.cached, 750);
+    assert.equal(bucket?.turns, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cursor scan skips a full reread when blob identity is unchanged", async () => {
+  const home = await mkdtemp(join(tmpdir(), "provider-usage-cursor-"));
+  const session = join(home, ".cursor", "acp-sessions", "ses-1");
+  await mkdir(session, { recursive: true });
+  const path = join(session, "store.db");
+  const Database = (await import("better-sqlite3")).default;
+  const db = new Database(path);
+  try {
+    db.exec("create table blobs (id text primary key, data blob)");
+    db.prepare("insert into blobs values (?, ?)").run(
+      "blob-1",
+      Buffer.from(
+        JSON.stringify({
+          role: "user",
+          content: "hello world from a cursor prompt",
+          providerOptions: { cursor: { requestId: "req-1" } },
+        }),
+      ),
+    );
+    db.prepare("insert into blobs values (?, ?)").run(
+      "blob-2",
+      Buffer.from(
+        JSON.stringify({
+          role: "assistant",
+          content: "a short reply",
+        }),
+      ),
+    );
+  } finally {
+    db.close();
+  }
+
+  try {
+    const first = scanCursorStores({ home });
+    assert.equal(first.length, 1);
+    assert.ok((first[0].blobCount ?? 0) >= 2);
+    const tokens = Object.values(first[0].daily).reduce(
+      (sum, bucket) => sum + bucket.tokens,
+      0,
+    );
+    assert.ok(tokens > 0);
+
+    const cache = new Map([
+      [
+        first[0].path,
+        {
+          mtimeMs: 0,
+          size: 0,
+          daily: first[0].daily,
+          blobCount: first[0].blobCount,
+          maxRowid: first[0].maxRowid,
+        },
+      ],
+    ]);
+    const second = scanCursorStores({ home, cached: cache });
+    assert.equal(second.length, 1);
+    assert.deepEqual(second[0].daily, first[0].daily);
+    assert.equal(second[0].blobCount, first[0].blobCount);
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });

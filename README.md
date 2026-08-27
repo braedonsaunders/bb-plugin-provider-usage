@@ -12,13 +12,20 @@ signed in to, on every machine BB knows about.
 per 10 seconds and stacked by provider, with the current rate over the trailing
 60 seconds, the best rate seen in the window, and the threads doing the work. It
 updates every couple of seconds while a turn is running and settles when the
-machine goes quiet.
+machine goes quiet. Archived and deleted threads drop out immediately — they
+are history, not current burn. BB's token events are authoritative; for
+BB-launched ACP sessions whose bridges do not emit them, the plugin maps the
+provider thread id back to opencode's exact local counters or Cursor's
+text-derived estimate.
 
 **Provider limits.** One pane, one row per signed-in provider: its plan, each
 rate-limit window (5-hour, weekly, monthly — whatever the provider reports), how
 much is left, and when it comes back. Every meter counts **down** — the ring,
 the bar, and the number all show what remains, the way each provider states its
-own limits.
+own limits. Cost-backed windows also show the amount used and the period cap.
+On the primary machine, Codex adds purchased-credit balance, banked reset count
+and expiry, model-specific limit buckets, and any on-demand spend control the
+Codex backend reports.
 
 **Token usage, for every provider.** A 7 / 30 / 90-day multi-series chart of
 real token volume, broken out into total, uncached input, output, and cached,
@@ -32,11 +39,10 @@ estimated from the recorded conversation text. The data reads from two tiers:
   `$CLAUDE_CONFIG_DIR`), Cursor's ACP session stores, and opencode
   (`~/.local/share/opencode`, or `$XDG_DATA_HOME/opencode`). These give full
   history and exact per-day attribution, back to before you installed BB.
-- **BB's own usage events** for everything else. `thread/tokenUsage/updated` is
-  part of the provider-bridge contract every provider plugin implements, so an
-  agent this plugin has never heard of — a new ACP agent, one you wrote
-  yourself — lands in the chart automatically as soon as it reports usage, with
-  a name and a colour of its own. No release here required.
+- **BB's own usage events** for everything else. As soon as a provider emits
+  `thread/tokenUsage/updated`, an agent this plugin has never heard of — a new
+  ACP agent, one you wrote yourself — lands in the chart automatically, with a
+  name and a colour of its own. No release here required.
 
 Providers with a dedicated scanner are excluded from the second tier, so
 nothing is counted twice.
@@ -82,8 +88,16 @@ long-running thread can decide whether to keep going or wait for a reset.
 ## How it works
 
 Subscription windows come from BB's own `system.usageLimits` for each signed-in
-provider, so there are no vendor API keys and no network calls of the plugin's
-own.
+provider. On the primary machine, a read-only `codex app-server` request fills
+in newer Codex fields that BB's provider-neutral schema does not yet carry. It
+uses the existing Codex sign-in and never reads, stores, or returns auth tokens.
+If the installed Codex version does not support the request, the panel silently
+falls back to BB's regular windows.
+
+The on-demand amount shown here is a provider-reported spend-control period. It
+is separate from organization-wide OpenAI Platform API billing. Exact Platform
+API spend comes from OpenAI's Costs API and requires an organization admin key;
+this plugin does not ask for or store one.
 
 Token totals come from a background `token-scan` service that walks local
 transcript files, caches per-file results in the plugin's SQLite database, and
@@ -96,12 +110,14 @@ total rather than the turn's, so consecutive events are differenced; a total
 that goes backwards means the thread was compacted or restarted upstream and is
 read as a fresh total rather than a negative one.
 
-Live throughput is a separate, deliberately different source: a `throughput-scan`
-service that follows `thread/tokenUsage/updated` for **every** provider, polling
-every two seconds while a thread is working and every ten when none is. Because
-it is the only source there, no provider is excluded and nothing is double
-counted — the trade is that work run outside BB, such as an agent CLI in a bare
-terminal, reports no events and does not appear.
+Live throughput is a separate, deliberately different path: a
+`throughput-scan` service follows `thread/tokenUsage/updated` for every provider
+that emits it, polling every two seconds while a thread is working and every ten
+when none is. Some ACP bridges currently omit that event. For BB-launched
+opencode and Cursor sessions, a local fallback resolves BB's persisted
+`thread/identity` to the matching provider session and reads only that session's
+store. Native events always win, so the two paths never count the same thread.
+Work run outside BB, such as an agent CLI in a bare terminal, remains excluded.
 
 Attribution is the subtle part. Those events carry the thread's *running* total,
 so consecutive events are differenced. The first event seen for a thread has
@@ -121,10 +137,11 @@ and go. The slots are checked rather than eyeballed: each sits in its mode's
 lightness band, clears the chroma floor, holds 3:1 against the surface, and keeps
 neighbouring slots apart under simulated protanopia and deuteranopia.
 
-A caveat worth stating plainly: the daily chart's second tier only sees what a
-provider actually reports. Providers that never emit `thread/tokenUsage/updated` will
-show subscription windows but no token series, and some agents (Factory Droid,
-Hermes) keep no usable per-turn token record on disk at all.
+A caveat worth stating plainly: the event fallback only sees what a provider
+actually reports. Providers that neither emit `thread/tokenUsage/updated` nor
+have a supported local store will show subscription windows but no token
+series, and some agents (Factory Droid, Hermes) keep no usable per-turn token
+record on disk at all.
 
 ## Develop
 

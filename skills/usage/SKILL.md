@@ -19,10 +19,15 @@ bb usage --machine <id-or-name>
 Use `totals.cumulativeRemainingPercent` for remaining quota across signed-in
 providers, `totals.tightest` for the most exhausted window, and each provider
 `windows[].remainingPercent` when deciding whether a thread should wait for a
-reset. Use `tokens.totals` and `tokens.providers` for global Codex/Claude
-transcript token volume across Codex, Claude Code, and Cursor.
+reset. Provider rows may also include `credits`, `resetCredits`, and
+`spendControl`; for Codex these expose purchased-credit balance, banked reset
+availability/expiry, and any backend-reported on-demand period. A window's
+`cost` gives exact used/limit dollars when the provider reports them. Use
+`tokens.totals` and `tokens.providers` for global Codex/Claude transcript token
+volume across Codex, Claude Code, Cursor, and opencode.
 
 `bb usage live` answers "what is being burned right now": `tokensPerMinute` is
 the trailing-60-second rate, `peakTokensPerMinute` the best rate in the last 15
-minutes, and `threads[]` attributes it to the threads doing the work. It counts
-only what BB drives, so an agent run outside BB does not appear.
+minutes, and `threads[]` attributes it to the threads doing the work. Archived
+and deleted threads are omitted. It counts only what BB drives, so an agent
+run outside BB does not appear.

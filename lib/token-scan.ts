@@ -3,8 +3,16 @@ import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { mergeCursorDaily, scanCursorStores } from "./cursor-scan";
-import { mergeOpencodeDaily, scanOpencodeStores } from "./opencode-scan";
+import {
+  isCursorStorePath,
+  mergeCursorDaily,
+  scanCursorStores,
+} from "./cursor-scan";
+import {
+  isOpencodeStorePath,
+  mergeOpencodeDaily,
+  scanOpencodeStores,
+} from "./opencode-scan";
 import {
   addBucket,
   dayKey,
@@ -20,7 +28,18 @@ export interface FileScanResult {
   size: number;
   daily: Record<string, TokenBucket>;
   keyedEvents?: Record<string, TokenEvent>;
+  blobCount?: number;
+  maxRowid?: number;
 }
+
+export type FileCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  daily: Record<string, TokenBucket>;
+  keyedEvents?: Record<string, TokenEvent>;
+  blobCount?: number;
+  maxRowid?: number;
+};
 
 export interface TokenEvent {
   atMs: number;
@@ -281,19 +300,35 @@ async function parseFile(
   return keyedEvents ? { daily, keyedEvents } : { daily };
 }
 
+/**
+ * Fold already-parsed cursor/opencode daily totals into a jsonl-only scan so
+ * the first snapshot can paint those series without opening the large stores.
+ */
+export function seedDailyFromCache(
+  daily: DailyProviderBuckets,
+  sources: string[],
+  cached: Iterable<[string, { daily: Record<string, TokenBucket> }]>,
+  kind: "cursor" | "opencode",
+): number {
+  if (sources.includes(kind)) return 0;
+  const files = [];
+  for (const [path, row] of cached) {
+    if (kind === "cursor" ? isCursorStorePath(path) : isOpencodeStorePath(path)) {
+      files.push({ path, mtimeMs: 0, size: 0, daily: row.daily });
+    }
+  }
+  if (files.length === 0) return 0;
+  if (kind === "cursor") mergeCursorDaily(daily, files);
+  else mergeOpencodeDaily(daily, files);
+  sources.push(kind);
+  return files.length;
+}
+
 export async function scanTokenFiles(options?: {
   nowMs?: number;
   includeCursor?: boolean;
   includeOpencode?: boolean;
-  cached?: Map<
-    string,
-    {
-      mtimeMs: number;
-      size: number;
-      daily: Record<string, TokenBucket>;
-      keyedEvents?: Record<string, TokenEvent>;
-    }
-  >;
+  cached?: Map<string, FileCacheEntry>;
 }): Promise<{
   files: FileScanResult[];
   changedFiles: number;

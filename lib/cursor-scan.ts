@@ -2,6 +2,10 @@ import { createRequire } from "node:module";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import type {
+  LocalThroughputSample,
+  LocalThroughputSource,
+} from "./local-throughput-scan";
 import {
   addBucket,
   dayKey,
@@ -14,6 +18,21 @@ export interface CursorFileScan {
   mtimeMs: number;
   size: number;
   daily: Record<string, TokenBucket>;
+  blobCount?: number;
+  maxRowid?: number;
+}
+
+export interface CursorCacheEntry {
+  mtimeMs: number;
+  size: number;
+  daily: Record<string, TokenBucket>;
+  blobCount?: number;
+  maxRowid?: number;
+}
+
+export function isCursorStorePath(path: string): boolean {
+  if (!path.endsWith("store.db")) return false;
+  return path.includes("acp-sessions") || path.includes("/chats/") || path.includes("\\chats\\");
 }
 
 const require = createRequire(import.meta.url);
@@ -24,9 +43,13 @@ type SqliteDb = {
   close(): void;
 };
 
+const CJK_RE = /[\u2e80-\u9fff]/;
+
 /** Approximate o200k/cl100k without shipping a BPE table. */
-function estimateTokens(text: string): number {
+export function estimateTokens(text: string): number {
   if (!text) return 0;
+  // Code and English never hit the CJK branch; skip the per-char walk.
+  if (!CJK_RE.test(text)) return Math.ceil(text.length / 3.6);
   let tokens = 0;
   let latin = 0;
   for (let i = 0; i < text.length; i += 1) {
@@ -122,16 +145,37 @@ function parseJsonBlob(data: unknown): Record<string, unknown> | null {
   return null;
 }
 
-function fileTimes(path: string): { mtimeMs: number; birthMs: number; size: number } {
+function fileTimes(
+  path: string,
+  includeWal = true,
+): { mtimeMs: number; birthMs: number; size: number } {
   const info = statSync(path);
   const birth =
     "birthtimeMs" in info && Number.isFinite(info.birthtimeMs)
       ? info.birthtimeMs
       : info.mtimeMs;
+  let mtimeMs = info.mtimeMs;
+  let size = info.size;
+  // Live throughput still watches WAL: a busy session can grow for a long
+  // time without checkpointing. The daily chart keys cache on the main file
+  // only — WAL/SHM mtime chatter was forcing a full reread of hundreds of
+  // stores on every page load.
+  if (includeWal) {
+    for (const suffix of ["-wal", "-shm"]) {
+      try {
+        const sidecar = statSync(`${path}${suffix}`);
+        if (!sidecar.isFile()) continue;
+        mtimeMs = Math.max(mtimeMs, sidecar.mtimeMs);
+        size += sidecar.size;
+      } catch {
+        // Sidecars appear and disappear around checkpoints.
+      }
+    }
+  }
   return {
-    mtimeMs: Math.round(info.mtimeMs),
+    mtimeMs: Math.round(mtimeMs),
     birthMs: Math.round(birth),
-    size: info.size,
+    size,
   };
 }
 
@@ -157,6 +201,24 @@ function subtractBucket(next: TokenBucket, prev: TokenBucket): TokenBucket {
  * window (capped), plus assistant output. Blobs have no timestamps, so the
  * first scan lands on session birth; later growth is attributed to mtime.
  */
+function readAcpStoreIdentity(file: string): { blobCount: number; maxRowid: number } | null {
+  const db = openSqlite(file);
+  if (!db) return null;
+  try {
+    const row = db.all<{ n: number; max_rowid: number | null }>(
+      "SELECT COUNT(*) AS n, MAX(rowid) AS max_rowid FROM blobs",
+    )[0];
+    return {
+      blobCount: Number(row?.n ?? 0),
+      maxRowid: Number(row?.max_rowid ?? 0),
+    };
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
 function readAcpStoreBucket(file: string): TokenBucket | null {
   const db = openSqlite(file);
   if (!db) return null;
@@ -256,21 +318,32 @@ function applyBucketToDaily(
   return daily;
 }
 
+function identityUnchanged(
+  prior: CursorCacheEntry | undefined,
+  identity: { blobCount: number; maxRowid: number } | null,
+): boolean {
+  return (
+    !!prior &&
+    !!identity &&
+    prior.blobCount === identity.blobCount &&
+    (prior.maxRowid ?? 0) === identity.maxRowid &&
+    !!prior.daily
+  );
+}
+
 export function scanCursorStores(options?: {
   nowMs?: number;
-  cached?: Map<
-    string,
-    { mtimeMs: number; size: number; daily: Record<string, TokenBucket> }
-  >;
+  home?: string;
+  cached?: Map<string, CursorCacheEntry>;
 }): CursorFileScan[] {
   const cached = options?.cached ?? new Map();
   const cutoff = (options?.nowMs ?? Date.now()) - 90 * 24 * 60 * 60 * 1000;
   const files: CursorFileScan[] = [];
 
-  for (const path of listAcpStorePaths()) {
+  for (const path of listAcpStorePaths(options?.home)) {
     let times;
     try {
-      times = fileTimes(path);
+      times = fileTimes(path, false);
     } catch {
       continue;
     }
@@ -278,18 +351,37 @@ export function scanCursorStores(options?: {
     if (times.mtimeMs < cutoff && times.birthMs < cutoff) continue;
 
     const prior = cached.get(path);
-    const stale =
+    const fingerprintStale =
       !prior ||
       prior.mtimeMs !== times.mtimeMs ||
       prior.size !== times.size;
 
     let daily: Record<string, TokenBucket>;
-    if (!stale && prior) {
+    let identity: { blobCount: number; maxRowid: number } | null =
+      prior?.blobCount != null
+        ? { blobCount: prior.blobCount, maxRowid: prior.maxRowid ?? 0 }
+        : null;
+
+    if (!fingerprintStale && prior) {
       daily = prior.daily;
     } else {
-      const bucket = readAcpStoreBucket(path);
-      if (!bucket) continue;
-      daily = applyBucketToDaily(prior?.daily, bucket, times.birthMs, times.mtimeMs);
+      // WAL/SHM mtime chatter used to bust every store. Identity is COUNT +
+      // MAX(rowid): a checkpoint with no new blobs is a cache hit. An older
+      // cache row with totals but no identity is also kept — we just stamp
+      // the identity so the next pass can skip the open entirely.
+      const nextIdentity = readAcpStoreIdentity(path);
+      if (
+        prior?.daily &&
+        (prior.blobCount == null || identityUnchanged(prior, nextIdentity))
+      ) {
+        daily = prior.daily;
+        identity = nextIdentity ?? identity;
+      } else {
+        const bucket = readAcpStoreBucket(path);
+        if (!bucket) continue;
+        daily = applyBucketToDaily(prior?.daily, bucket, times.birthMs, times.mtimeMs);
+        identity = nextIdentity;
+      }
     }
 
     files.push({
@@ -297,6 +389,9 @@ export function scanCursorStores(options?: {
       mtimeMs: times.mtimeMs,
       size: times.size,
       daily,
+      ...(identity
+        ? { blobCount: identity.blobCount, maxRowid: identity.maxRowid }
+        : {}),
     });
   }
 
@@ -316,4 +411,48 @@ export function mergeCursorDaily(
       daily[day] = row;
     }
   }
+}
+
+/**
+ * Cursor ACP stores have no per-message token counters or timestamps. This
+ * source therefore reports the same growing text-derived session estimate as
+ * the daily chart. The local scanner differences successive snapshots and
+ * labels them under the BB thread whose provider identity owns the store.
+ */
+export function createCursorLiveThroughputSource(options?: {
+  home?: string;
+}): LocalThroughputSource {
+  const root = join(options?.home ?? homedir(), ".cursor/acp-sessions");
+  const fingerprints = new Map<string, string>();
+
+  return {
+    providerId: "cursor",
+    scan({ sessionIds }) {
+      const samples: LocalThroughputSample[] = [];
+      for (const sessionId of sessionIds) {
+        const path = join(root, sessionId, "store.db");
+        if (!existsSync(path)) continue;
+        let times;
+        try {
+          times = fileTimes(path);
+        } catch {
+          continue;
+        }
+        const fingerprint = `${times.mtimeMs}:${times.size}`;
+        if (fingerprints.get(path) === fingerprint) continue;
+        const bucket = readAcpStoreBucket(path);
+        if (!bucket) continue;
+        fingerprints.set(path, fingerprint);
+        samples.push({
+          id: path,
+          sessionId,
+          atMs: times.mtimeMs,
+          startedAtMs: times.birthMs,
+          bucket,
+          cumulative: true,
+        });
+      }
+      return samples;
+    },
+  };
 }

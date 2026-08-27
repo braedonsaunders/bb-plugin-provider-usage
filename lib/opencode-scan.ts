@@ -2,6 +2,10 @@ import { createRequire } from "node:module";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type {
+  LocalThroughputSample,
+  LocalThroughputSource,
+} from "./local-throughput-scan";
 import { addBucket, dayKey, emptyBucket, type TokenBucket } from "./tokens";
 
 export interface OpencodeFileScan {
@@ -63,6 +67,10 @@ function openSqlite(file: string): SqliteDb | null {
       return null;
     }
   }
+}
+
+export function isOpencodeStorePath(path: string): boolean {
+  return path.endsWith("opencode.db");
 }
 
 /** `$XDG_DATA_HOME/opencode`, else the platform default. */
@@ -142,6 +150,7 @@ export function extractOpencodeBucket(record: unknown): TokenBucket | null {
 
 export function scanOpencodeStores(options?: {
   nowMs?: number;
+  paths?: readonly string[];
   cached?: Map<
     string,
     { mtimeMs: number; size: number; daily: Record<string, TokenBucket> }
@@ -151,7 +160,7 @@ export function scanOpencodeStores(options?: {
   const cutoff = (options?.nowMs ?? Date.now()) - 90 * 24 * 60 * 60 * 1000;
   const files: OpencodeFileScan[] = [];
 
-  for (const path of opencodeDbPaths()) {
+  for (const path of options?.paths ?? opencodeDbPaths()) {
     const fingerprint = dbFingerprint(path);
     if (!fingerprint) continue;
 
@@ -169,25 +178,51 @@ export function scanOpencodeStores(options?: {
     if (!db) continue;
     const daily: Record<string, TokenBucket> = {};
     try {
-      const rows = db.all<{ time_created: number; data: string }>(
-        "select time_created, data from message" +
-          " where time_created >= ? and data like '%\"tokens\"%'",
+      // Pull only the token scalars. Shipping `data` (avg ~7KB, some multi-MB)
+      // into JS just to JSON.parse it is the cold-scan cost on a 1GB db.
+      const rows = db.all<{
+        time_created: number;
+        total: unknown;
+        input: unknown;
+        output: unknown;
+        reasoning: unknown;
+        cache_read: unknown;
+        cache_write: unknown;
+      }>(
+        "select time_created," +
+          " json_extract(data, '$.tokens.total') as total," +
+          " json_extract(data, '$.tokens.input') as input," +
+          " json_extract(data, '$.tokens.output') as output," +
+          " json_extract(data, '$.tokens.reasoning') as reasoning," +
+          " json_extract(data, '$.tokens.cache.read') as cache_read," +
+          " json_extract(data, '$.tokens.cache.write') as cache_write" +
+          " from message where time_created >= ?" +
+          " and (json_extract(data, '$.tokens.total') > 0" +
+          " or json_extract(data, '$.tokens.cache.read') > 0" +
+          " or json_extract(data, '$.tokens.cache.write') > 0)",
         cutoff,
       );
       for (const row of rows) {
-        let record: unknown;
-        try {
-          record = JSON.parse(row.data);
-        } catch {
-          continue;
-        }
-        const bucket = extractOpencodeBucket(record);
-        if (!bucket) continue;
         const atMs = asNumber(row.time_created);
         if (atMs <= 0) continue;
+        const input = asNumber(row.input);
+        const output = asNumber(row.output);
+        const reasoning = asNumber(row.reasoning);
+        const cached = asNumber(row.cache_read) + asNumber(row.cache_write);
+        const reportedTotal = asNumber(row.total);
+        const tokens =
+          reportedTotal > 0 ? reportedTotal : input + output + reasoning + cached;
+        if (tokens <= 0 && cached <= 0) continue;
         const key = dayKey(atMs);
         const current = daily[key] ?? emptyBucket();
-        addBucket(current, bucket);
+        addBucket(current, {
+          tokens,
+          input,
+          output,
+          cached,
+          reasoning,
+          turns: 1,
+        });
         daily[key] = current;
       }
     } catch {
@@ -215,4 +250,87 @@ export function mergeOpencodeDaily(
       daily[day] = row;
     }
   }
+}
+
+const LIVE_RESCAN_OVERLAP_MS = 5 * 60_000;
+
+function opencodeCompletedAt(record: unknown, fallback: number): number {
+  if (!record || typeof record !== "object") return fallback;
+  const time = (record as Record<string, unknown>).time;
+  if (!time || typeof time !== "object") return fallback;
+  const completed = asNumber((time as Record<string, unknown>).completed);
+  return completed > 0 ? completed : fallback;
+}
+
+/**
+ * Exact per-call samples for opencode sessions launched by BB. The source
+ * keeps a small overlap because opencode inserts a zero-token assistant row
+ * when a call starts, then updates that same row with final usage on finish.
+ */
+export function createOpencodeLiveThroughputSource(options?: {
+  paths?: readonly string[];
+}): LocalThroughputSource {
+  const newestCreatedAt = new Map<string, number>();
+
+  return {
+    providerId: "opencode",
+    scan({ sessionIds, sinceMs }) {
+      const samples: LocalThroughputSample[] = [];
+      const paths = options?.paths ?? opencodeDbPaths();
+      for (const path of paths) {
+        const db = openSqlite(path);
+        if (!db) continue;
+        try {
+          for (const sessionId of sessionIds) {
+            const previous = newestCreatedAt.get(sessionId);
+            const cutoff =
+              previous === undefined
+                ? sinceMs
+                : Math.max(sinceMs, previous - LIVE_RESCAN_OVERLAP_MS);
+            const rows = db.all<{
+              id: string;
+              session_id: string;
+              time_created: number;
+              time_updated: number;
+              data: string;
+            }>(
+              "select id, session_id, time_created, time_updated, data" +
+                " from message where session_id = ? and time_created >= ?" +
+                " and data like '%\"tokens\"%' order by time_created asc, id asc",
+              sessionId,
+              cutoff,
+            );
+            let latest = previous ?? 0;
+            for (const row of rows) {
+              const createdAt = asNumber(row.time_created);
+              if (createdAt > latest) latest = createdAt;
+              let record: unknown;
+              try {
+                record = JSON.parse(row.data);
+              } catch {
+                continue;
+              }
+              const bucket = extractOpencodeBucket(record);
+              if (!bucket) continue;
+              const atMs = opencodeCompletedAt(
+                record,
+                asNumber(row.time_updated) || createdAt,
+              );
+              if (atMs <= sinceMs) continue;
+              samples.push({
+                id: row.id,
+                sessionId: row.session_id,
+                atMs,
+                bucket,
+              });
+            }
+            if (latest > 0) newestCreatedAt.set(sessionId, latest);
+          }
+        } finally {
+          db.close();
+        }
+      }
+      return samples;
+    },
+  };
 }

@@ -18,6 +18,10 @@ import { cn } from "@/lib/utils";
 import { SERIES_STYLESHEET, providerColor } from "@/lib/series-palette";
 import { formatTokenCount } from "@/lib/tokens";
 import { formatRate, type ThroughputSnapshot } from "@/lib/throughput";
+import {
+  LiveThroughputSkeleton,
+  Skeleton,
+} from "@/components/usage-skeletons";
 
 /** The chart advances on its own clock, so it refetches even while quiet. */
 const POLL_MS = 2_000;
@@ -111,13 +115,9 @@ function useMeasuredWidth<T extends HTMLElement>() {
   return [ref, width] as const;
 }
 
-/** Round an axis maximum up to a 1 / 2 / 5 × 10ⁿ step so ticks read cleanly. */
-function niceCeil(value: number): number {
-  if (value <= 0) return 1;
-  const magnitude = 10 ** Math.floor(Math.log10(value));
-  const scaled = value / magnitude;
-  const step = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
-  return step * magnitude;
+/** Axis max so the tallest value sits ~10% below the top of the plot. */
+function axisMaxForPeak(peak: number): number {
+  return peak <= 0 ? 1 : peak / 0.9;
 }
 
 function formatClock(atMs: number): string {
@@ -173,7 +173,7 @@ function ThroughputChart({
   const bins = snapshot.series;
   const slot = innerW / Math.max(1, bins.length);
   const barWidth = Math.max(2, Math.min(12, slot - 2));
-  const axisMax = niceCeil(Math.max(...bins.map((bin) => bin.total), 0));
+  const axisMax = axisMaxForPeak(Math.max(...bins.map((bin) => bin.total), 0));
   const yAt = (value: number) => PAD.top + innerH * (1 - value / axisMax);
   const slotX = (index: number) => PAD.left + slot * index;
 
@@ -406,27 +406,31 @@ export function LiveThroughputSection() {
             turn reports them
           </p>
         </div>
-        <span
-          className={cn(
-            "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
-            data?.live
-              ? "border-success/30 text-success"
-              : "border-border text-muted-foreground",
-          )}
-        >
+        {data ? (
           <span
             className={cn(
-              "size-1.5 rounded-full",
-              data?.live ? "animate-pulse bg-success" : "bg-muted-foreground",
+              "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
+              data.live
+                ? "border-success/30 text-success"
+                : "border-border text-muted-foreground",
             )}
-          />
-          {data?.live ? "Live" : "Quiet"}
-        </span>
+          >
+            <span
+              className={cn(
+                "size-1.5 rounded-full",
+                data.live ? "animate-pulse bg-success" : "bg-muted-foreground",
+              )}
+            />
+            {data.live ? "Live" : "Quiet"}
+          </span>
+        ) : (
+          <Skeleton className="h-5 w-14 rounded-full" />
+        )}
       </CardHeader>
 
-      <CardContent className="space-y-4 p-5 pt-0">
+      <CardContent className="space-y-4 p-5 pt-0" aria-busy={loading && !data}>
         {loading && !data ? (
-          <div className="h-56 animate-pulse rounded-md bg-muted" />
+          <LiveThroughputSkeleton />
         ) : error && !data ? (
           <p className="text-sm text-muted-foreground">{error}</p>
         ) : data ? (

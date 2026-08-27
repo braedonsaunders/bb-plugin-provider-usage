@@ -27,6 +27,15 @@ export interface ThroughputScanThread {
   status: string;
   updatedAt: number;
   createdAt: number;
+  archivedAt?: number | null;
+  deletedAt?: number | null;
+}
+
+/** Live throughput is "what is running now". Archived and deleted threads are history. */
+export function isLiveThroughputThread(
+  thread: Pick<ThroughputScanThread, "archivedAt" | "deletedAt">,
+): boolean {
+  return !thread.archivedAt && !thread.deletedAt;
 }
 
 export interface ThroughputScanDeps {
@@ -145,7 +154,8 @@ export function createThroughputScanner(
         return { scanned: 0, tracked: cursors.size, working: 0 };
       }
 
-      const live = new Set(threads.map((thread) => thread.id));
+      const liveThreads = threads.filter(isLiveThroughputThread);
+      const live = new Set(liveThreads.map((thread) => thread.id));
       for (const threadId of [...cursors.keys()]) {
         if (!live.has(threadId)) {
           cursors.delete(threadId);
@@ -154,7 +164,7 @@ export function createThroughputScanner(
       }
 
       const cutoff = nowMs - windowMs - POLL_GRACE_MS;
-      const candidates = threads.filter((thread) => {
+      const candidates = liveThreads.filter((thread) => {
         if (dirty.has(thread.id)) return true;
         if (thread.status !== "idle" && thread.status !== "error") return true;
         return thread.updatedAt >= cutoff;
@@ -194,7 +204,7 @@ export function createThroughputScanner(
         cursors.set(thread.id, ingest(thread, events, cursor, nowMs));
       }
 
-      const working = threads.filter(
+      const working = liveThreads.filter(
         (thread) => thread.status !== "idle" && thread.status !== "error",
       ).length;
       return { scanned, tracked: cursors.size, working };

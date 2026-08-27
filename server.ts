@@ -9,7 +9,12 @@ import {
   type ProviderLimitSlice,
   type UsageHost,
 } from "./lib/dashboard";
-import { scanTokenFiles, type FileScanResult } from "./lib/token-scan";
+import {
+  scanTokenFiles,
+  seedDailyFromCache,
+  type FileCacheEntry,
+  type FileScanResult,
+} from "./lib/token-scan";
 import {
   mergeDaily,
   scanBbThreadUsage,
@@ -33,6 +38,16 @@ import {
   createThroughputScanner,
   type ThroughputScanThread,
 } from "./lib/throughput-scan";
+import { createLocalThroughputScanner } from "./lib/local-throughput-scan";
+import { createOpencodeLiveThroughputSource } from "./lib/opencode-scan";
+import { createCursorLiveThroughputSource } from "./lib/cursor-scan";
+import { readCodexUsageSupplement } from "./lib/codex-usage";
+import {
+  hasRateLimitedProvider,
+  overlayLastGoodLimits,
+  rememberGoodLimits,
+  shouldReuseCachedLimits,
+} from "./lib/limits-cache";
 
 const usageWindowSchema = z.object({
   label: z.string(),
@@ -64,6 +79,30 @@ const providerUsageSchema = z.object({
   planLabel: z.string().nullable(),
   message: z.string().nullable(),
   windows: z.array(usageWindowSchema),
+  credits: z
+    .object({
+      hasCredits: z.boolean(),
+      unlimited: z.boolean(),
+      balance: z.string().nullable(),
+    })
+    .nullable(),
+  spendControl: z
+    .object({
+      used: z.string(),
+      limit: z.string(),
+      remainingPercent: z.number(),
+      resetsAt: z.string().nullable(),
+      reached: z.boolean().nullable(),
+    })
+    .nullable(),
+  resetCredits: z
+    .object({
+      availableCount: z.number().int(),
+      nextExpiresAt: z.string().nullable(),
+      title: z.string().nullable(),
+      description: z.string().nullable(),
+    })
+    .nullable(),
 });
 
 const dashboardSchema = z.object({
@@ -183,7 +222,12 @@ const throughputSnapshotSchema = z.object({
 
 export const rpcContract = defineRpcContract({
   getDashboard: {
-    input: z.object({ hostId: z.string().nullable() }).strict(),
+    input: z
+      .object({
+        hostId: z.string().nullable(),
+        force: z.boolean().optional(),
+      })
+      .strict(),
     output: dashboardSchema,
   },
   getTokens: {
@@ -208,9 +252,95 @@ function asLimitSlice(value: unknown): ProviderLimitSlice {
   return value as ProviderLimitSlice;
 }
 
+type LastGoodLimits = Partial<Record<ProviderKey, ProviderLimitSlice>>;
+
+type LastFetch = {
+  at: number;
+  hostId: string | null;
+  limits: Record<ProviderKey, ProviderLimitSlice>;
+  rateLimitedAt: number | null;
+};
+
+function createLimitStore(bb: BbPluginApi) {
+  const db = bb.storage.database();
+  const read = db.prepare("SELECT value FROM limits_cache WHERE key = ?");
+  const write = db.prepare(
+    `INSERT INTO limits_cache (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  );
+
+  const readJson = <T>(key: string): T | null => {
+    const row = read.get(key) as { value?: string } | undefined;
+    if (!row?.value) return null;
+    try {
+      return JSON.parse(row.value) as T;
+    } catch {
+      return null;
+    }
+  };
+
+  let lastGood = readJson<LastGoodLimits>("last-good") ?? {};
+  let lastFetch = readJson<LastFetch>("last-fetch");
+  let inflight: Promise<Record<ProviderKey, ProviderLimitSlice>> | null = null;
+
+  const persist = () => {
+    write.run("last-good", JSON.stringify(lastGood));
+    if (lastFetch) write.run("last-fetch", JSON.stringify(lastFetch));
+  };
+
+  const readLive = async (hostId: string | null) => {
+    const raw = await bb.sdk.system.usageLimits(hostId ? { hostId } : {});
+    const fresh = Object.fromEntries(
+      PROVIDER_KEYS.map((key) => [key, asLimitSlice(raw[key])]),
+    ) as Record<ProviderKey, ProviderLimitSlice>;
+    const limits = overlayLastGoodLimits(fresh, lastGood);
+    lastGood = rememberGoodLimits(limits, lastGood);
+    lastFetch = {
+      at: Date.now(),
+      hostId,
+      limits,
+      rateLimitedAt: hasRateLimitedProvider(fresh) ? Date.now() : null,
+    };
+    persist();
+    if (hasRateLimitedProvider(fresh)) {
+      bb.log.warn(
+        "usage limits: a provider was rate-limited; serving last good windows",
+      );
+    }
+    return limits;
+  };
+
+  const get = async (hostId: string | null, force = false) => {
+    if (
+      lastFetch &&
+      lastFetch.hostId === hostId &&
+      shouldReuseCachedLimits({
+        nowMs: Date.now(),
+        fetchedAtMs: lastFetch.at,
+        rateLimitedAtMs: lastFetch.rateLimitedAt,
+        force,
+      })
+    ) {
+      return lastFetch.limits;
+    }
+    if (inflight && !force) return inflight;
+    const run = readLive(hostId);
+    inflight = run;
+    try {
+      return await run;
+    } finally {
+      if (inflight === run) inflight = null;
+    }
+  };
+
+  return { get };
+}
+
 async function loadDashboard(
   bb: BbPluginApi,
   hostId: string | null,
+  limitsStore: { get: (hostId: string | null, force?: boolean) => Promise<Record<ProviderKey, ProviderLimitSlice>> },
+  force = false,
 ): Promise<DashboardSnapshot> {
   const hosts = (await bb.sdk.hosts.list()).map(
     (host): UsageHost => ({
@@ -221,19 +351,19 @@ async function loadDashboard(
   );
   const resolvedHostId =
     hostId && hosts.some((host) => host.id === hostId) ? hostId : null;
-  const [limits, catalog] = await Promise.all([
-    bb.sdk.system.usageLimits(
-      resolvedHostId ? { hostId: resolvedHostId } : {},
-    ),
+  const [slices, catalog] = await Promise.all([
+    limitsStore.get(resolvedHostId, force),
     bb.sdk.providers.list(resolvedHostId ? { hostId: resolvedHostId } : {}),
   ]);
 
-  const slices = Object.fromEntries(
-    PROVIDER_KEYS.map((key) => [key, asLimitSlice(limits[key])]),
-  ) as Record<ProviderKey, ProviderLimitSlice>;
+  const codexSupplement =
+    resolvedHostId === null && slices.codex.status === "ok"
+      ? await readCodexUsageSupplement()
+      : null;
 
   return assembleDashboard({
     limits: slices,
+    supplements: codexSupplement ? { codex: codexSupplement } : undefined,
     hosts,
     catalog,
     hostId: resolvedHostId,
@@ -290,6 +420,8 @@ type PersistedTokenFile = {
   version: 2;
   daily: Record<string, TokenBucket>;
   keyedEvents?: FileScanResult["keyedEvents"];
+  blobCount?: number;
+  maxRowid?: number;
 };
 
 function isPersistedTokenFile(value: unknown): value is PersistedTokenFile {
@@ -318,17 +450,13 @@ function createTokenStore(bb: BbPluginApi) {
     // Identity-aware transcript parsing stores Claude message ids so the same
     // response is deduplicated across fragments and copied subagent files.
     `DELETE FROM token_file_cache`,
+    `CREATE TABLE IF NOT EXISTS limits_cache (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )`,
   ]);
 
-  const loadCache = new Map<
-    string,
-    {
-      mtimeMs: number;
-      size: number;
-      daily: Record<string, TokenBucket>;
-      keyedEvents?: FileScanResult["keyedEvents"];
-    }
-  >();
+  const loadCache = new Map<string, FileCacheEntry>();
   for (const row of db
     .prepare(
       "SELECT path, mtime_ms, size, daily_json FROM token_file_cache",
@@ -347,6 +475,9 @@ function createTokenStore(bb: BbPluginApi) {
         daily: persisted.daily,
         ...(persisted.keyedEvents
           ? { keyedEvents: persisted.keyedEvents }
+          : {}),
+        ...(persisted.blobCount != null
+          ? { blobCount: persisted.blobCount, maxRowid: persisted.maxRowid }
           : {}),
       });
     } catch {
@@ -386,6 +517,9 @@ function createTokenStore(bb: BbPluginApi) {
             version: 2,
             daily: file.daily,
             ...(file.keyedEvents ? { keyedEvents: file.keyedEvents } : {}),
+            ...(file.blobCount != null
+              ? { blobCount: file.blobCount, maxRowid: file.maxRowid }
+              : {}),
           } satisfies PersistedTokenFile),
         );
         loadCache.set(file.path, {
@@ -393,6 +527,9 @@ function createTokenStore(bb: BbPluginApi) {
           size: file.size,
           daily: file.daily,
           ...(file.keyedEvents ? { keyedEvents: file.keyedEvents } : {}),
+          ...(file.blobCount != null
+            ? { blobCount: file.blobCount, maxRowid: file.maxRowid }
+            : {}),
         });
       }
     });
@@ -424,6 +561,18 @@ function createTokenStore(bb: BbPluginApi) {
     [...loadCache.keys()].some(
       (path) => path.includes("acp-sessions") || path.endsWith("store.db"),
     );
+  const hasOpencodeCache = () =>
+    [...loadCache.keys()].some((path) => path.endsWith("opencode.db"));
+
+  const paintCachedStores = (
+    scanned: {
+      sources: string[];
+      daily: Record<string, Record<string, TokenBucket>>;
+    },
+  ) => {
+    seedDailyFromCache(scanned.daily, scanned.sources, loadCache, "cursor");
+    seedDailyFromCache(scanned.daily, scanned.sources, loadCache, "opencode");
+  };
 
   /**
    * Every provider bb can drive, without a scanner per vendor: bb's own
@@ -468,21 +617,37 @@ function createTokenStore(bb: BbPluginApi) {
     inflight = (async () => {
       const nowMs = Date.now();
       const cached = force ? new Map() : loadCache;
+      const phase1Started = Date.now();
+      // jsonl (Codex/Claude) is the cheap first paint. Seed cursor/opencode
+      // from the last persisted totals so those series never vanish while
+      // the heavier stores refresh.
       const jsonl = await scanTokenFiles({
         cached,
         includeCursor: false,
         includeOpencode: false,
       });
       persistFiles(jsonl.files);
+      if (!force) paintCachedStores(jsonl);
       snapshotFrom(days, jsonl);
       publish();
-      const full = await scanTokenFiles({ cached: loadCache, includeCursor: true });
+      bb.log.info(
+        `token scan phase1 ${Date.now() - phase1Started}ms sources=[${jsonl.sources.join(", ")}]`,
+      );
+
+      const phase2Started = Date.now();
+      const full = await scanTokenFiles({
+        cached: loadCache,
+        includeCursor: true,
+        includeOpencode: true,
+      });
       persistFiles(full.files);
       const bbUsage = await scanBbThreads(nowMs);
       mergeDaily(full.daily, bbUsage.daily);
       full.sources.push(...bbUsage.providers);
       bb.log.info(
-        `bb thread usage: ${bbUsage.threadsScanned} thread(s) reporting, ` +
+        `token scan phase2 ${Date.now() - phase2Started}ms ` +
+          `changed=${full.changedFiles} ` +
+          `bbThreads=${bbUsage.threadsScanned} ` +
           `providers [${bbUsage.providers.join(", ") || "none"}]`,
       );
       const snapshot = snapshotFrom(days, full);
@@ -501,7 +666,9 @@ function createTokenStore(bb: BbPluginApi) {
         const scanned = await scanTokenFiles({
           cached: loadCache,
           includeCursor: hasCursorCache(),
+          includeOpencode: hasOpencodeCache(),
         });
+        paintCachedStores(scanned);
         return assembleTokenSnapshot({
           days,
           fileCount: scanned.files.length,
@@ -523,8 +690,10 @@ function createTokenStore(bb: BbPluginApi) {
     const jsonl = await scanTokenFiles({
       cached: loadCache,
       includeCursor: false,
+      includeOpencode: false,
     });
     persistFiles(jsonl.files);
+    paintCachedStores(jsonl);
     const snapshot = snapshotFrom(days, jsonl);
     void sync(days);
     return snapshot;
@@ -541,15 +710,14 @@ function createThroughputStore(bb: BbPluginApi) {
   const recorder = createThroughputRecorder();
   let tracked = 0;
   let working = 0;
+  let sharedThreads: Promise<ThroughputScanThread[]> | null = null;
+  let refreshInflight: Promise<ThroughputSnapshot> | null = null;
 
-  const scanner = createThroughputScanner(recorder, {
-    onError: (error) =>
-      bb.log.warn(
-        `throughput scan: ${error instanceof Error ? error.message : String(error)}`,
-      ),
-    listThreads: async () => {
-      const rows = await bb.sdk.threads.list({ includeHidden: true });
-      return rows.map(
+  const readThreads = async (): Promise<ThroughputScanThread[]> => {
+    const rows = await bb.sdk.threads.list({ includeHidden: true });
+    return rows
+      .filter((row) => !row.archivedAt && !row.deletedAt)
+      .map(
         (row): ThroughputScanThread => ({
           id: row.id,
           providerId: row.providerId,
@@ -557,9 +725,19 @@ function createThroughputStore(bb: BbPluginApi) {
           status: row.status,
           updatedAt: row.updatedAt,
           createdAt: row.createdAt,
+          archivedAt: row.archivedAt ?? null,
+          deletedAt: row.deletedAt ?? null,
         }),
       );
-    },
+  };
+  const listThreads = () => sharedThreads ?? readThreads();
+
+  const scanner = createThroughputScanner(recorder, {
+    onError: (error) =>
+      bb.log.warn(
+        `throughput scan: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    listThreads,
     listEvents: async ({ threadId, afterSeq, order, limit }) => {
       const rows = await bb.sdk.threads.events.list({
         threadId,
@@ -586,20 +764,79 @@ function createThroughputStore(bb: BbPluginApi) {
     },
   });
 
+  const localScanner = createLocalThroughputScanner(recorder, {
+    listThreads,
+    sources: [
+      createOpencodeLiveThroughputSource(),
+      createCursorLiveThroughputSource(),
+    ],
+    onError: (error) =>
+      bb.log.warn(
+        `local throughput scan: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    listThreadSessionInfo: async (threadId) => {
+      const [identityRows, usageRows] = await Promise.all([
+        bb.sdk.threads.events.list({
+          threadId,
+          types: ["thread/identity"],
+          order: "desc",
+          limit: "100",
+        }),
+        bb.sdk.threads.events.list({
+          threadId,
+          types: ["thread/tokenUsage/updated"],
+          order: "desc",
+          limit: "1",
+        }),
+      ]);
+      const sessionIds = new Set<string>();
+      for (const row of identityRows) {
+        if (row.type === "thread/identity" && row.data.providerThreadId) {
+          sessionIds.add(row.data.providerThreadId);
+        }
+      }
+      return {
+        sessionIds: [...sessionIds],
+        hasNativeUsage: usageRows.some(
+          (row) => row.type === "thread/tokenUsage/updated",
+        ),
+      };
+    },
+  });
+
   const snapshot = (nowMs = Date.now()): ThroughputSnapshot =>
     recorder.snapshot(nowMs, tracked);
 
   const refresh = async (): Promise<ThroughputSnapshot> => {
-    const result = await scanner.refresh();
-    tracked = result.tracked;
-    working = result.working;
-    return snapshot();
+    if (refreshInflight) return refreshInflight;
+    const run = (async () => {
+      const nowMs = Date.now();
+      sharedThreads = readThreads();
+      try {
+        const result = await scanner.refresh(nowMs);
+        await localScanner.refresh(nowMs);
+        tracked = result.tracked;
+        working = result.working;
+        return snapshot(nowMs);
+      } finally {
+        sharedThreads = null;
+      }
+    })();
+    refreshInflight = run;
+    try {
+      return await run;
+    } finally {
+      if (refreshInflight === run) refreshInflight = null;
+    }
   };
 
   return {
     snapshot,
     refresh,
-    markDirty: (threadId: string) => scanner.markDirty(threadId),
+    markDirty: (threadId: string) => {
+      scanner.markDirty(threadId);
+      localScanner.markDirty(threadId);
+    },
     /** Poll fast while work is in flight, slowly when the machine is quiet. */
     intervalMs: () => (working > 0 ? THROUGHPUT_BUSY_MS : THROUGHPUT_QUIET_MS),
   };
@@ -608,11 +845,12 @@ function createThroughputStore(bb: BbPluginApi) {
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
   const tokens = createTokenStore(bb);
+  const limits = createLimitStore(bb);
   const throughput = createThroughputStore(bb);
 
   bb.rpc.register(rpcContract, {
-    async getDashboard({ hostId }) {
-      return loadDashboard(bb, hostId);
+    async getDashboard({ hostId, force }) {
+      return loadDashboard(bb, hostId, limits, force === true);
     },
     async getTokens({ days, force }) {
       return tokens.get(days, force === true);
@@ -772,7 +1010,7 @@ export default async function plugin(bb: BbPluginApi) {
         resolvedHostId = match.id;
       }
 
-      const snapshot = await loadDashboard(bb, resolvedHostId);
+      const snapshot = await loadDashboard(bb, resolvedHostId, limits);
       const tokenSnapshot = await tokens.get(days, force);
       if (json) {
         return {

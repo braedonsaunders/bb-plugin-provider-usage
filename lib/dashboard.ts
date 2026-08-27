@@ -61,6 +61,30 @@ export interface ProviderUsage {
   planLabel: string | null;
   message: string | null;
   windows: UsageWindow[];
+  credits: ProviderCreditBalance | null;
+  spendControl: ProviderSpendControl | null;
+  resetCredits: ProviderResetCredits | null;
+}
+
+export interface ProviderCreditBalance {
+  hasCredits: boolean;
+  unlimited: boolean;
+  balance: string | null;
+}
+
+export interface ProviderSpendControl {
+  used: string;
+  limit: string;
+  remainingPercent: number;
+  resetsAt: string | null;
+  reached: boolean | null;
+}
+
+export interface ProviderResetCredits {
+  availableCount: number;
+  nextExpiresAt: string | null;
+  title: string | null;
+  description: string | null;
 }
 
 export interface UsageHost {
@@ -113,6 +137,13 @@ export interface ProviderLimitSlice {
   }>;
 }
 
+export interface ProviderSupplement {
+  windows: NonNullable<ProviderLimitSlice["windows"]>;
+  credits: ProviderCreditBalance | null;
+  spendControl: ProviderSpendControl | null;
+  resetCredits: ProviderResetCredits | null;
+}
+
 export interface ProviderCatalogEntry {
   id: string;
   displayName: string;
@@ -139,6 +170,15 @@ export function formatUsdCents(cents: number): string {
 
 export function formatPercent(value: number): string {
   return `${Math.round(clampPercent(value))}%`;
+}
+
+export function formatCreditAmount(value: string | null): string {
+  if (value === null) return "Unknown";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return value;
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 2,
+  }).format(numeric);
 }
 
 export function formatResetAbsolute(iso: string | null): string {
@@ -219,6 +259,23 @@ function normalizeWindows(
       cost,
     };
   });
+}
+
+function mergeWindows(
+  reported: ProviderLimitSlice["windows"] | undefined,
+  supplemental: ProviderLimitSlice["windows"] | undefined,
+): UsageWindow[] {
+  const merged = normalizeWindows(reported);
+  for (const next of normalizeWindows(supplemental)) {
+    const duplicate = merged.some(
+      (current) =>
+        current.label.toLocaleLowerCase() === next.label.toLocaleLowerCase() &&
+        current.resetsAt === next.resetsAt &&
+        Math.abs(current.usedPercent - next.usedPercent) < 0.01,
+    );
+    if (!duplicate) merged.push(next);
+  }
+  return merged;
 }
 
 function resolveCatalog(
@@ -309,6 +366,7 @@ function buildTotals(providers: ProviderUsage[]): UsageTotals {
 
 export function assembleDashboard(input: {
   limits: Record<ProviderKey, ProviderLimitSlice>;
+  supplements?: Partial<Record<ProviderKey, ProviderSupplement>>;
   hosts: UsageHost[];
   catalog: readonly ProviderCatalogEntry[];
   hostId: string | null;
@@ -316,6 +374,7 @@ export function assembleDashboard(input: {
 }): DashboardSnapshot {
   const providers = PROVIDER_KEYS.map((key) => {
     const slice = input.limits[key];
+    const supplement = input.supplements?.[key];
     const identity = resolveCatalog(key, input.catalog);
     return {
       key,
@@ -326,7 +385,15 @@ export function assembleDashboard(input: {
       accountEmail: slice.accountEmail ?? null,
       planLabel: slice.planLabel ?? null,
       message: slice.message ?? null,
-      windows: slice.status === "ok" ? normalizeWindows(slice.windows) : [],
+      windows:
+        slice.status === "ok"
+          ? mergeWindows(slice.windows, supplement?.windows)
+          : [],
+      credits: slice.status === "ok" ? (supplement?.credits ?? null) : null,
+      spendControl:
+        slice.status === "ok" ? (supplement?.spendControl ?? null) : null,
+      resetCredits:
+        slice.status === "ok" ? (supplement?.resetCredits ?? null) : null,
     } satisfies ProviderUsage;
   });
 
@@ -398,6 +465,31 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
         : "";
       lines.push(
         `  ${window.label.padEnd(18)} ${formatPercent(window.remainingPercent)} left · ${formatPercent(window.usedPercent)} used${cost}${reset}`,
+      );
+    }
+    if (provider.credits) {
+      const value = provider.credits.unlimited
+        ? "Unlimited"
+        : provider.credits.hasCredits
+          ? `${formatCreditAmount(provider.credits.balance)} credits`
+          : "No credits";
+      lines.push(`  ${"Credit balance".padEnd(18)} ${value}`);
+    }
+    if (provider.resetCredits) {
+      const count = provider.resetCredits.availableCount;
+      const expiry = provider.resetCredits.nextExpiresAt
+        ? ` · next expires ${formatResetAbsolute(provider.resetCredits.nextExpiresAt)} (in ${formatResetRelative(provider.resetCredits.nextExpiresAt)})`
+        : "";
+      lines.push(
+        `  ${"Banked resets".padEnd(18)} ${count} available${expiry}`,
+      );
+    }
+    if (provider.spendControl) {
+      const reset = provider.spendControl.resetsAt
+        ? ` · resets ${formatResetAbsolute(provider.spendControl.resetsAt)} (in ${formatResetRelative(provider.spendControl.resetsAt)})`
+        : "";
+      lines.push(
+        `  ${"On-demand period".padEnd(18)} ${provider.spendControl.used} of ${provider.spendControl.limit} used${reset}`,
       );
     }
   }

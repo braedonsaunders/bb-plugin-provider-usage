@@ -23,6 +23,9 @@ const {
   THROUGHPUT_WINDOW_MS,
 } = await import("../lib/throughput.ts");
 const { createThroughputScanner } = await import("../lib/throughput-scan.ts");
+const { createLocalThroughputScanner } = await import(
+  "../lib/local-throughput-scan.ts"
+);
 const { providerSlotIndex } = await import("../lib/series-palette.ts");
 
 const NOW = 1_760_000_000_000;
@@ -346,5 +349,211 @@ test("threads that disappear stop being tracked", async () => {
   threads = [];
   const second = await scanner.refresh(NOW);
   assert.equal(second.tracked, 0);
-  assert.equal(recorder.snapshot(NOW).threads.length, 1); // the turn still happened
+  assert.equal(recorder.snapshot(NOW).threads.length, 0);
+  assert.equal(recorder.snapshot(NOW).windowTotals.tokens, 0);
+});
+
+test("an archived thread drops out of live throughput immediately", async () => {
+  const recorder = createThroughputRecorder();
+  let threads = [
+    {
+      id: "thr_old_goal",
+      providerId: "codex",
+      title: "Review recent commits for defects",
+      status: "idle",
+      updatedAt: NOW,
+      createdAt: NOW - 60_000,
+    },
+  ];
+  const scanner = createThroughputScanner(recorder, {
+    listThreads: async () => threads,
+    listEvents: async () => [
+      {
+        seq: 1,
+        createdAt: NOW - 5_000,
+        total: { totalTokens: 2_000_000, inputTokens: 2_000_000, outputTokens: 0 },
+      },
+    ],
+  });
+
+  await scanner.refresh(NOW);
+  assert.equal(recorder.snapshot(NOW).threads.length, 1);
+
+  threads = [
+    {
+      ...threads[0],
+      archivedAt: NOW,
+    },
+  ];
+  await scanner.refresh(NOW);
+  const snapshot = recorder.snapshot(NOW);
+  assert.equal(snapshot.threads.length, 0);
+  assert.equal(snapshot.windowTotals.tokens, 0);
+});
+
+test("local per-call usage is mapped back to its BB provider thread", async () => {
+  const recorder = createThroughputRecorder();
+  const samples = [
+    {
+      id: "msg_1",
+      sessionId: "ses_1",
+      atMs: NOW - 5_000,
+      bucket: bucket(900, { input: 100, cached: 750, output: 50 }),
+    },
+  ];
+  const scanner = createLocalThroughputScanner(recorder, {
+    listThreads: async () => [
+      {
+        id: "thr_open",
+        providerId: "acp-opencode",
+        title: "Open work",
+        status: "active",
+        updatedAt: NOW,
+        createdAt: NOW - 6 * 60 * 60_000,
+      },
+    ],
+    listThreadSessionInfo: async () => ({
+      sessionIds: ["ses_1"],
+      hasNativeUsage: false,
+    }),
+    sources: [
+      {
+        providerId: "opencode",
+        scan: async () => samples,
+      },
+    ],
+  });
+
+  await scanner.refresh(NOW);
+  await scanner.refresh(NOW);
+  const snapshot = recorder.snapshot(NOW);
+  assert.equal(snapshot.windowTotals.tokens, 900); // stable id dedupes polls
+  assert.deepEqual(
+    snapshot.providers.map((provider) => provider.id),
+    ["opencode"],
+  );
+  assert.equal(snapshot.threads[0].threadId, "thr_open");
+  assert.equal(snapshot.threads[0].title, "Open work");
+});
+
+test("an archived local thread drops out of live throughput immediately", async () => {
+  const recorder = createThroughputRecorder();
+  let threads = [
+    {
+      id: "thr_open",
+      providerId: "acp-opencode",
+      title: "Open work",
+      status: "active",
+      updatedAt: NOW,
+      createdAt: NOW - 60_000,
+    },
+  ];
+  const scanner = createLocalThroughputScanner(recorder, {
+    listThreads: async () => threads,
+    listThreadSessionInfo: async () => ({
+      sessionIds: ["ses_1"],
+      hasNativeUsage: false,
+    }),
+    sources: [
+      {
+        providerId: "opencode",
+        scan: async () => [
+          {
+            id: "msg_1",
+            sessionId: "ses_1",
+            atMs: NOW - 5_000,
+            bucket: bucket(900),
+          },
+        ],
+      },
+    ],
+  });
+
+  await scanner.refresh(NOW);
+  assert.equal(recorder.snapshot(NOW).threads.length, 1);
+
+  threads = [{ ...threads[0], archivedAt: NOW, status: "idle" }];
+  await scanner.refresh(NOW);
+  const snapshot = recorder.snapshot(NOW);
+  assert.equal(snapshot.threads.length, 0);
+  assert.equal(snapshot.windowTotals.tokens, 0);
+});
+
+test("native BB token usage suppresses the local fallback", async () => {
+  const recorder = createThroughputRecorder();
+  let scans = 0;
+  const scanner = createLocalThroughputScanner(recorder, {
+    listThreads: async () => [
+      {
+        id: "thr_open",
+        providerId: "acp-opencode",
+        title: null,
+        status: "active",
+        updatedAt: NOW,
+        createdAt: NOW - 60_000,
+      },
+    ],
+    listThreadSessionInfo: async () => ({
+      sessionIds: ["ses_1"],
+      hasNativeUsage: true,
+    }),
+    sources: [
+      {
+        providerId: "opencode",
+        scan: async () => {
+          scans += 1;
+          return [];
+        },
+      },
+    ],
+  });
+
+  await scanner.refresh(NOW);
+  assert.equal(scans, 0);
+  assert.equal(recorder.snapshot(NOW).windowTotals.tokens, 0);
+});
+
+test("an older cumulative local source baselines once, then charts growth", async () => {
+  const recorder = createThroughputRecorder();
+  let total = 1_000;
+  let atMs = NOW - 40_000;
+  const scanner = createLocalThroughputScanner(recorder, {
+    listThreads: async () => [
+      {
+        id: "thr_cursor",
+        providerId: "acp-cursor",
+        title: "Cursor work",
+        status: "active",
+        updatedAt: NOW,
+        createdAt: NOW - 6 * 60 * 60_000,
+      },
+    ],
+    listThreadSessionInfo: async () => ({
+      sessionIds: ["cursor-session"],
+      hasNativeUsage: false,
+    }),
+    sources: [
+      {
+        providerId: "cursor",
+        scan: async () => [
+          {
+            id: "store.db",
+            sessionId: "cursor-session",
+            atMs,
+            startedAtMs: NOW - 6 * 60 * 60_000,
+            bucket: bucket(total),
+            cumulative: true,
+          },
+        ],
+      },
+    ],
+  });
+
+  await scanner.refresh(NOW);
+  assert.equal(recorder.snapshot(NOW).windowTotals.tokens, 0);
+
+  total = 1_450;
+  atMs = NOW - 5_000;
+  await scanner.refresh(NOW);
+  assert.equal(recorder.snapshot(NOW).windowTotals.tokens, 450);
 });

@@ -325,6 +325,9 @@ export function createThroughputRecorder(options?: {
     },
     forgetThread(threadId: string): void {
       threads.delete(threadId);
+      // Archived/deleted threads leave the live list. Their leftover window
+      // samples would keep the row on the chart as if the work were still on.
+      deltas = deltas.filter((delta) => delta.threadId !== threadId);
     },
     snapshot(nowMs = Date.now(), trackedThreads?: number): ThroughputSnapshot {
       prune(nowMs);

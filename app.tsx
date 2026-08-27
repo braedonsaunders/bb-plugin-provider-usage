@@ -12,13 +12,16 @@ import {
 } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import {
+  formatCreditAmount,
   formatFetchedAt,
   formatPercent,
   formatResetAbsolute,
   formatResetRelative,
+  formatUsdCents,
   remainingTone,
   statusLabel,
   type DashboardSnapshot,
+  type ProviderUsage,
   type RemainingTone,
   type UsageWindow,
 } from "./lib/dashboard";
@@ -30,8 +33,16 @@ import {
 } from "./lib/tokens";
 import { SERIES_STYLESHEET, providerColor } from "./lib/series-palette";
 import { LiveThroughputSection } from "./components/live-throughput";
+import {
+  HomepageUsageSkeleton,
+  ProviderLimitsSkeleton,
+  Skeleton,
+  TokenUsageSkeleton,
+} from "./components/usage-skeletons";
 
 const REFRESH_MS = 60_000;
+/** Homepage chips and the sidebar % don't need a live Anthropic poll. */
+const BACKGROUND_REFRESH_MS = 5 * 60_000;
 
 function toneText(tone: RemainingTone): string {
   if (tone === "critical") return "text-destructive";
@@ -68,19 +79,26 @@ function toneRing(tone: RemainingTone): string {
  */
 const providerSwatch = providerColor;
 
-function useDashboard(hostId: string | null) {
+function useDashboard(
+  hostId: string | null,
+  options?: { pollMs?: number },
+) {
   const rpc = useRpc<typeof rpcContract>();
+  const pollMs = options?.pollMs ?? REFRESH_MS;
   const [data, setData] = useState<DashboardSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(
-    async (mode: "initial" | "refresh" = "refresh") => {
+    async (mode: "initial" | "refresh" | "force" = "refresh") => {
       if (mode === "initial") setLoading(true);
       else setRefreshing(true);
       try {
-        const next = await rpc.call("getDashboard", { hostId });
+        const next = await rpc.call("getDashboard", {
+          hostId,
+          force: mode === "force",
+        });
         setData(next);
         setError(null);
       } catch (cause) {
@@ -102,7 +120,7 @@ function useDashboard(hostId: string | null) {
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void load("refresh");
-    }, REFRESH_MS);
+    }, pollMs);
     const onVisible = () => {
       if (document.visibilityState === "visible") void load("refresh");
     };
@@ -111,9 +129,9 @@ function useDashboard(hostId: string | null) {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [load]);
+  }, [load, pollMs]);
 
-  return { data, error, loading, refreshing, reload: () => load("refresh") };
+  return { data, error, loading, refreshing, reload: () => load("force") };
 }
 
 function useTokens(days: TokenWindowDays) {
@@ -154,10 +172,18 @@ function TokenChart({ snapshot }: { snapshot: TokenSnapshot }) {
   const [hover, setHover] = useState<number | null>(null);
   const width = 960;
   const height = 260;
-  const pad = { l: 12, r: 12, t: 18, b: 28 };
+  const pad = { l: 12, r: 12, t: 8, b: 28 };
   const innerW = width - pad.l - pad.r;
   const innerH = height - pad.t - pad.b;
-  const max = Math.max(1, ...snapshot.series.map((point) => point.total));
+  // Lines are overlaid, not stacked — scale to the tallest series, not the
+  // daily total, and leave ~10% of the plot above that peak.
+  const peak = Math.max(
+    1,
+    ...snapshot.series.flatMap((point) =>
+      seriesIds.map((id) => point.byProvider[id] ?? 0),
+    ),
+  );
+  const max = peak / 0.9;
   const last = snapshot.series.length - 1;
   const active = hover == null ? null : snapshot.series[hover];
 
@@ -344,9 +370,9 @@ function TokenUsageSection() {
           ))}
         </div>
       </CardHeader>
-      <CardContent className="space-y-4 p-5 pt-0">
+      <CardContent className="space-y-4 p-5 pt-0" aria-busy={loading && !data}>
         {loading && !data ? (
-          <div className="h-44 animate-pulse rounded-md bg-muted" />
+          <TokenUsageSkeleton />
         ) : error && !data ? (
           <div className="space-y-2 text-sm text-muted-foreground">
             <p>{error}</p>
@@ -455,15 +481,23 @@ function Gauge({
  */
 function UsageBar({ window }: { window: UsageWindow }) {
   const tone = remainingTone(window.remainingPercent);
+  const detail = [
+    window.cost
+      ? `${formatUsdCents(window.cost.usedUsdCents)} of ${formatUsdCents(window.cost.limitUsdCents)} used`
+      : null,
+    window.resetsAt
+      ? `Resets ${formatResetAbsolute(window.resetsAt)} · in ${formatResetRelative(window.resetsAt)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <div className="space-y-2">
       <div className="flex items-baseline justify-between gap-3">
         <div className="min-w-0">
           <p className="truncate text-sm font-medium">{window.label}</p>
           <p className="text-xs text-muted-foreground">
-            {window.resetsAt
-              ? `Resets ${formatResetAbsolute(window.resetsAt)} · in ${formatResetRelative(window.resetsAt)}`
-              : "No reset time reported"}
+            {detail || "No reset time reported"}
           </p>
         </div>
         <p
@@ -491,6 +525,66 @@ function UsageBar({ window }: { window: UsageWindow }) {
           style={{ width: `${window.remainingPercent}%` }}
         />
       </div>
+    </div>
+  );
+}
+
+function ProviderDetails({ provider }: { provider: ProviderUsage }) {
+  const rows: Array<{ label: string; value: string; hint: string | null }> = [];
+  if (provider.credits) {
+    rows.push({
+      label: "Credit balance",
+      value: provider.credits.unlimited
+        ? "Unlimited"
+        : provider.credits.hasCredits
+          ? `${formatCreditAmount(provider.credits.balance)} credits`
+          : "No credits",
+      hint: "Available after included plan usage",
+    });
+  }
+  if (provider.resetCredits) {
+    const count = provider.resetCredits.availableCount;
+    rows.push({
+      label: "Banked resets",
+      value: `${count} available`,
+      hint: provider.resetCredits.nextExpiresAt
+        ? `${provider.resetCredits.title ?? "Next reset"} expires ${formatResetAbsolute(provider.resetCredits.nextExpiresAt)} · in ${formatResetRelative(provider.resetCredits.nextExpiresAt)}`
+        : null,
+    });
+  }
+  if (provider.spendControl) {
+    rows.push({
+      label: "On-demand period",
+      value: `${provider.spendControl.used} of ${provider.spendControl.limit} used`,
+      hint: provider.spendControl.reached
+        ? "Spend control reached"
+        : provider.spendControl.resetsAt
+          ? `Resets ${formatResetAbsolute(provider.spendControl.resetsAt)} · in ${formatResetRelative(provider.spendControl.resetsAt)}`
+          : `${formatPercent(provider.spendControl.remainingPercent)} left`,
+    });
+  }
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+      {rows.map((row) => (
+        <div
+          key={row.label}
+          className="rounded-lg border border-border bg-muted/20 px-3 py-2.5"
+        >
+          <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            {row.label}
+          </p>
+          <p className="mt-0.5 text-sm font-semibold tabular-nums">
+            {row.value}
+          </p>
+          {row.hint ? (
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              {row.hint}
+            </p>
+          ) : null}
+        </div>
+      ))}
     </div>
   );
 }
@@ -552,84 +646,59 @@ function Metric({
   );
 }
 
-function DashboardBody({
-  hostId,
-  onHosts,
+function ProviderLimitsSection({
+  data,
+  error,
+  loading,
+  refreshing,
+  onReload,
 }: {
-  hostId: string | null;
-  onHosts?: (hosts: DashboardSnapshot["hosts"]) => void;
+  data: DashboardSnapshot | null;
+  error: string | null;
+  loading: boolean;
+  refreshing: boolean;
+  onReload: () => void;
 }) {
-  const { data, error, loading, refreshing, reload } = useDashboard(hostId);
-
-  useEffect(() => {
-    if (data) onHosts?.(data.hosts);
-  }, [data, onHosts]);
-
-  if (loading && !data) {
-    return (
-      <div className="grid gap-3 md:grid-cols-4">
-        {Array.from({ length: 4 }, (_, index) => (
-          <div key={index} className="h-24 animate-pulse rounded-lg bg-muted" />
-        ))}
-      </div>
-    );
-  }
-
-  if (error && !data) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Could not load usage</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3 text-sm text-muted-foreground">
-          <p>{error}</p>
-          <Button size="sm" variant="outline" onClick={() => void reload()}>
-            Try again
-          </Button>
-        </CardContent>
-      </Card>
-    );
-  }
-
-  if (!data) return null;
-
   return (
-    <div className="space-y-5">
-      {error ? (
-        <p className="text-xs text-destructive">Refresh failed: {error}</p>
-      ) : null}
-
-      <LiveThroughputSection />
-
-      <TokenUsageSection />
-
-      <Card className="shadow-none">
-        <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0 p-5 pb-4">
-          <div>
-            <CardTitle className="text-base">Provider limits</CardTitle>
-            <p className="mt-1 text-xs text-muted-foreground">
-              What is left of each plan window, and when it comes back
-            </p>
+    <Card className="shadow-none">
+      <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0 p-5 pb-4">
+        <div>
+          <CardTitle className="text-base">Provider limits</CardTitle>
+          <p className="mt-1 text-xs text-muted-foreground">
+            What is left of each plan window, and when it comes back
+          </p>
+        </div>
+        <button
+          type="button"
+          title={
+            refreshing
+              ? "Refreshing…"
+              : data
+                ? `Updated ${formatFetchedAt(data.fetchedAt)}`
+                : "Refresh"
+          }
+          className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+          onClick={() => void onReload()}
+        >
+          <HugeiconsIcon
+            icon={RefreshIcon}
+            className={cn("size-3.5", refreshing && "animate-spin")}
+          />
+          Refresh
+        </button>
+      </CardHeader>
+      <CardContent className="divide-y divide-border p-0" aria-busy={loading && !data}>
+        {loading && !data ? (
+          <ProviderLimitsSkeleton />
+        ) : error && !data ? (
+          <div className="space-y-3 p-5 text-sm text-muted-foreground">
+            <p>{error}</p>
+            <Button size="sm" variant="outline" onClick={() => void onReload()}>
+              Try again
+            </Button>
           </div>
-          <button
-            type="button"
-            title={
-              refreshing
-                ? "Refreshing…"
-                : `Updated ${formatFetchedAt(data.fetchedAt)}`
-            }
-            className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-            onClick={() => void reload()}
-          >
-            <HugeiconsIcon
-              icon={RefreshIcon}
-              className={cn("size-3.5", refreshing && "animate-spin")}
-            />
-            Refresh
-          </button>
-        </CardHeader>
-        <CardContent className="divide-y divide-border p-0">
-          {data.providers.map((provider) => {
+        ) : data ? (
+          data.providers.map((provider) => {
             const hero = provider.windows[0];
             return (
               <div
@@ -661,8 +730,11 @@ function DashboardBody({
                 </div>
                 <div className="min-w-0 flex-1 space-y-4">
                   {provider.status === "ok" && provider.windows.length > 0 ? (
-                    provider.windows.map((window) => (
-                      <UsageBar key={window.label} window={window} />
+                    provider.windows.map((window, index) => (
+                      <UsageBar
+                        key={`${window.label}-${window.resetsAt ?? index}`}
+                        window={window}
+                      />
                     ))
                   ) : (
                     <p className="text-sm text-muted-foreground">
@@ -676,12 +748,47 @@ function DashboardBody({
                             : provider.message ?? "Usage is unavailable right now."}
                     </p>
                   )}
+                  {provider.status === "ok" ? (
+                    <ProviderDetails provider={provider} />
+                  ) : null}
                 </div>
               </div>
             );
-          })}
-        </CardContent>
-      </Card>
+          })
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DashboardBody({
+  hostId,
+  onHosts,
+}: {
+  hostId: string | null;
+  onHosts?: (hosts: DashboardSnapshot["hosts"]) => void;
+}) {
+  const { data, error, loading, refreshing, reload } = useDashboard(hostId);
+
+  useEffect(() => {
+    if (data) onHosts?.(data.hosts);
+  }, [data, onHosts]);
+
+  return (
+    <div className="space-y-5">
+      {error && data ? (
+        <p className="text-xs text-destructive">Refresh failed: {error}</p>
+      ) : null}
+
+      <LiveThroughputSection />
+      <TokenUsageSection />
+      <ProviderLimitsSection
+        data={data}
+        error={error}
+        loading={loading}
+        refreshing={refreshing}
+        onReload={reload}
+      />
     </div>
   );
 }
@@ -718,11 +825,11 @@ function DashboardPage() {
 }
 
 function HomepageUsage() {
-  const { data, loading } = useDashboard(null);
+  const { data, loading } = useDashboard(null, { pollMs: BACKGROUND_REFRESH_MS });
   const cards = useMemo(() => data?.providers ?? [], [data]);
 
   if (loading && !data) {
-    return <div className="h-24 animate-pulse rounded-lg bg-muted" />;
+    return <HomepageUsageSkeleton />;
   }
   if (!data) return null;
 
@@ -755,10 +862,10 @@ function HomepageUsage() {
 }
 
 function SidebarAccessory() {
-  const { data } = useDashboard(null);
+  const { data } = useDashboard(null, { pollMs: BACKGROUND_REFRESH_MS });
   const remaining = data?.totals.cumulativeRemainingPercent;
   if (remaining === null || remaining === undefined) {
-    return <span className="text-muted-foreground">—</span>;
+    return <Skeleton className="inline-block h-3 w-8 align-middle" />;
   }
   return (
     <span
