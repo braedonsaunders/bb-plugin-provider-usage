@@ -30,6 +30,17 @@ export const PROVIDER_META: Record<
   },
 };
 
+/** Map dashboard keys to `system.usageLimits` response keys from the host. */
+export function pickProviderLimitRaw(
+  limits: Record<string, unknown>,
+  key: ProviderKey,
+): unknown {
+  for (const id of PROVIDER_META[key].matchIds) {
+    if (id in limits) return limits[id];
+  }
+  return limits[key];
+}
+
 export type UsageStatus =
   | "ok"
   | "not_installed"

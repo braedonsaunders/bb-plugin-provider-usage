@@ -4,6 +4,7 @@ import {
   PROVIDER_KEYS,
   assembleDashboard,
   formatDashboardText,
+  pickProviderLimitRaw,
   type DashboardSnapshot,
   type ProviderKey,
   type ProviderLimitSlice,
@@ -290,8 +291,12 @@ function createLimitStore(bb: BbPluginApi) {
 
   const readLive = async (hostId: string | null) => {
     const raw = await bb.sdk.system.usageLimits(hostId ? { hostId } : {});
+    const limitsRecord = raw as Record<string, unknown>;
     const fresh = Object.fromEntries(
-      PROVIDER_KEYS.map((key) => [key, asLimitSlice(raw[key])]),
+      PROVIDER_KEYS.map((key) => [
+        key,
+        asLimitSlice(pickProviderLimitRaw(limitsRecord, key)),
+      ]),
     ) as Record<ProviderKey, ProviderLimitSlice>;
     const limits = overlayLastGoodLimits(fresh, lastGood);
     lastGood = rememberGoodLimits(limits, lastGood);
