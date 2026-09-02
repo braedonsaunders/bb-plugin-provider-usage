@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-provider-usage",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "description": "Live token throughput, remaining plan quota and reset windows for every signed-in provider, plus 7/30/90-day token volume from local transcripts and BB's own usage events.",
   "license": "MIT",
   "author": "Braedon Saunders",

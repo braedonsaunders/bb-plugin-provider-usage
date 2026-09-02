@@ -1,4 +1,4 @@
-export const PROVIDER_KEYS = ["codex", "claudeCode", "cursor"] as const;
+export const PROVIDER_KEYS = ["codex", "claudeCode", "cursor", "muse"] as const;
 export type ProviderKey = (typeof PROVIDER_KEYS)[number];
 
 export const PROVIDER_META: Record<
@@ -27,6 +27,12 @@ export const PROVIDER_META: Record<
     displayName: "Cursor",
     fallbackLogoUrl: "/api/v1/system/providers/acp-cursor/logo",
     matchIds: ["acp-cursor", "cursor"],
+  },
+  muse: {
+    id: "muse",
+    displayName: "Muse Code",
+    fallbackLogoUrl: "/api/v1/system/providers/muse/logo",
+    matchIds: ["muse"],
   },
 };
 
@@ -301,6 +307,15 @@ function resolveCatalog(
   };
 }
 
+function isRegistered(
+  key: ProviderKey,
+  catalog: readonly ProviderCatalogEntry[],
+): boolean {
+  return catalog.some((provider) =>
+    PROVIDER_META[key].matchIds.includes(provider.id),
+  );
+}
+
 function heroWindow(provider: ProviderUsage): UsageWindow | undefined {
   return provider.windows.find((window) => !window.cost) ?? provider.windows[0];
 }
@@ -383,8 +398,22 @@ export function assembleDashboard(input: {
   hostId: string | null;
   fetchedAt?: string;
 }): DashboardSnapshot {
-  const providers = PROVIDER_KEYS.map((key) => {
+  /**
+   * A provider that is neither installed nor registered on this host is not a
+   * meter the user is missing — it is an agent they never added. Plugin-supplied
+   * providers only reach the catalog once their plugin is installed, so this is
+   * what keeps the dashboard to the agents that actually exist here. A provider
+   * bb ships stays listed even when uninstalled, because "not installed" is real
+   * news for those.
+   */
+  const trackedKeys = PROVIDER_KEYS.filter((key) => {
     const slice = input.limits[key];
+    if (slice === undefined) return false;
+    return slice.status !== "not_installed" || isRegistered(key, input.catalog);
+  });
+
+  const providers = trackedKeys.map((key) => {
+    const slice = input.limits[key]!;
     const supplement = input.supplements?.[key];
     const identity = resolveCatalog(key, input.catalog);
     return {

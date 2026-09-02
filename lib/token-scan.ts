@@ -165,6 +165,47 @@ function extractCodexRunningBucket(record: unknown): {
   return { atMs, bucket };
 }
 
+/**
+ * Muse writes one `model_completed` record per model call, with the provider's
+ * counters verbatim. Cached tokens sit inside `input_tokens` and reasoning sits
+ * inside `output_tokens`, so the honest total is input plus output.
+ */
+export function extractMuseBucket(record: unknown): {
+  atMs: number;
+  bucket: TokenBucket;
+} | null {
+  if (!record || typeof record !== "object") return null;
+  const row = record as Record<string, unknown>;
+  const payload = row.payload;
+  if (!payload || typeof payload !== "object") return null;
+  const event = (payload as Record<string, unknown>).event;
+  if (!event || typeof event !== "object") return null;
+  const body = event as Record<string, unknown>;
+  if (body.kind !== "model_completed") return null;
+  const usage = body.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const row_ = usage as Record<string, unknown>;
+  const bucket = usageBucket({
+    total: asNumber(row_.input_tokens) + asNumber(row_.output_tokens),
+    input: row_.input_tokens,
+    output: row_.output_tokens,
+    cached:
+      asNumber(row_.cached_tokens) + asNumber(row_.cache_write_tokens),
+    reasoning: row_.reasoning_tokens,
+    inputIncludesCached: true,
+  });
+  if (!bucket) return null;
+  return { atMs: museRecordedAtMs(row.recorded_at), bucket };
+}
+
+/** Muse stamps records in microseconds since the epoch. */
+function museRecordedAtMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  if (value > 1e14) return Math.round(value / 1000);
+  if (value > 1e11) return Math.round(value);
+  return Math.round(value * 1000);
+}
+
 export function extractClaudeBucket(record: unknown): {
   atMs: number;
   bucket: TokenBucket;
@@ -202,6 +243,15 @@ async function walkJsonl(root: string): Promise<string[]> {
   return found;
 }
 
+/** Muse follows XDG on every platform, with `MUSE_HOME` relocating the lot. */
+function museDataHome(home: string, env: NodeJS.ProcessEnv): string {
+  const museHome = env.MUSE_HOME?.trim();
+  if (museHome) return join(museHome, "data");
+  const xdgData = env.XDG_DATA_HOME?.trim();
+  if (xdgData) return join(xdgData, "muse");
+  return join(home, ".local", "share", "muse");
+}
+
 export function tokenRoots(home = homedir(), env = process.env): {
   id: string;
   root: string;
@@ -211,6 +261,7 @@ export function tokenRoots(home = homedir(), env = process.env): {
   const claudeHome = env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
   roots.push({ id: "codex", root: join(codexHome, "sessions") });
   roots.push({ id: "claude-code", root: join(claudeHome, "projects") });
+  roots.push({ id: "muse", root: join(museDataHome(home, env), "sessions") });
   return roots;
 }
 
@@ -254,7 +305,9 @@ async function parseFile(
     const interesting =
       providerId === "codex"
         ? line.includes("token_count")
-        : line.includes('"assistant"') && line.includes("usage");
+        : providerId === "muse"
+          ? line.includes("model_completed")
+          : line.includes('"assistant"') && line.includes("usage");
     if (!interesting) continue;
     let record: unknown;
     try {
@@ -277,7 +330,9 @@ async function parseFile(
     const hit =
       providerId === "codex"
         ? extractCodexBucket(record)
-        : extractClaudeBucket(record);
+        : providerId === "muse"
+          ? extractMuseBucket(record)
+          : extractClaudeBucket(record);
     if (!hit) continue;
     const messageId =
       providerId === "claude-code" ? claudeMessageId(record) : null;
@@ -292,9 +347,15 @@ async function parseFile(
       }
       continue;
     }
-    const fingerprint = `${hit.bucket.input}:${hit.bucket.output}:${hit.bucket.cached}:${hit.bucket.reasoning}`;
-    if (fingerprint === lastFingerprint) continue;
-    lastFingerprint = fingerprint;
+    /**
+     * Muse records one row per completion and repeats nothing, so two identical
+     * calls in a session are two real calls rather than one re-emitted total.
+     */
+    if (providerId !== "muse") {
+      const fingerprint = `${hit.bucket.input}:${hit.bucket.output}:${hit.bucket.cached}:${hit.bucket.reasoning}`;
+      if (fingerprint === lastFingerprint) continue;
+      lastFingerprint = fingerprint;
+    }
     addDaily(daily, hit.atMs, hit.bucket);
   }
   return keyedEvents ? { daily, keyedEvents } : { daily };

@@ -1,7 +1,13 @@
 export const TOKEN_WINDOWS = [7, 30, 90] as const;
 export type TokenWindowDays = (typeof TOKEN_WINDOWS)[number];
 
-export const TOKEN_PROVIDERS = ["codex", "claude-code", "cursor", "opencode"] as const;
+export const TOKEN_PROVIDERS = [
+  "codex",
+  "claude-code",
+  "cursor",
+  "opencode",
+  "muse",
+] as const;
 export type TokenProviderId = (typeof TOKEN_PROVIDERS)[number];
 
 export interface TokenBucket {
@@ -114,6 +120,7 @@ const PROVIDER_NAMES: Record<string, string> = {
   "claude-code": "Claude Code",
   cursor: "Cursor",
   opencode: "opencode",
+  muse: "Muse Code",
   pi: "Pi",
   grok: "Grok",
   "hermes-agent": "Hermes Agent",

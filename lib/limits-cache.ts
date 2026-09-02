@@ -7,9 +7,11 @@ import {
 export const LIMITS_TTL_MS = 5 * 60_000;
 export const RATE_LIMIT_BACKOFF_MS = 15 * 60_000;
 
-export function isRateLimitedSlice(slice: ProviderLimitSlice): boolean {
+export function isRateLimitedSlice(
+  slice: ProviderLimitSlice | undefined,
+): boolean {
   return (
-    slice.status === "error" && /rate limited/i.test(slice.message ?? "")
+    slice?.status === "error" && /rate limited/i.test(slice.message ?? "")
   );
 }
 
@@ -48,7 +50,8 @@ export function rememberGoodLimits(
 ): Partial<Record<ProviderKey, ProviderLimitSlice>> {
   const next = { ...prior };
   for (const key of PROVIDER_KEYS) {
-    if (limits[key].status === "ok") next[key] = limits[key];
+    const slice = limits[key];
+    if (slice?.status === "ok") next[key] = slice;
   }
   return next;
 }

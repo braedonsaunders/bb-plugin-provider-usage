@@ -18,11 +18,15 @@ BB-launched ACP sessions whose bridges do not emit them, the plugin maps the
 provider thread id back to opencode's exact local counters or Cursor's
 text-derived estimate.
 
-**Provider limits.** One pane, one row per signed-in provider: its plan, each
+**Provider limits.** One pane, one row per provider: its plan, each
 rate-limit window (5-hour, weekly, monthly — whatever the provider reports), how
 much is left, and when it comes back. Every meter counts **down** — the ring,
 the bar, and the number all show what remains, the way each provider states its
 own limits. Cost-backed windows also show the amount used and the period cap.
+A provider bb ships stays listed even when it is not installed, because that is
+real news; a plugin-supplied provider such as Muse Code appears only once its
+plugin is installed.
+
 On the primary machine, Codex adds purchased-credit balance, banked reset count
 and expiry, model-specific limit buckets, and any on-demand spend control the
 Codex backend reports.
@@ -36,8 +40,9 @@ estimated from the recorded conversation text. The data reads from two tiers:
 
 - **Transcript scanners** for the agents that keep detailed local records —
   Codex (`~/.codex`, or `$CODEX_HOME`), Claude Code (`~/.claude`, or
-  `$CLAUDE_CONFIG_DIR`), Cursor's ACP session stores, and opencode
-  (`~/.local/share/opencode`, or `$XDG_DATA_HOME/opencode`). These give full
+  `$CLAUDE_CONFIG_DIR`), Cursor's ACP session stores, opencode
+  (`~/.local/share/opencode`, or `$XDG_DATA_HOME/opencode`), and Muse Code
+  (`~/.local/share/muse`, or `$MUSE_HOME`/`$XDG_DATA_HOME`). These give full
   history and exact per-day attribution, back to before you installed BB.
 - **BB's own usage events** for everything else. As soon as a provider emits
   `thread/tokenUsage/updated`, an agent this plugin has never heard of — a new

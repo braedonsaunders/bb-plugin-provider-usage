@@ -52,9 +52,10 @@ const PROVIDER_SLOTS: Record<string, number> = {
   codex: 1,
   cursor: 2,
   opencode: 3,
+  muse: 4,
 };
 
-const OVERFLOW_SLOTS = [4, 5];
+const OVERFLOW_SLOTS = [5];
 
 export function providerSlotIndex(providerId: string): number {
   const seated = PROVIDER_SLOTS[providerId];
