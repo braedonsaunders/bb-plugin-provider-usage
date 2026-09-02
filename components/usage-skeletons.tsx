@@ -108,7 +108,17 @@ export function TokenUsageSkeleton() {
         ))}
       </div>
 
-      <ChartGrid className="h-64">
+      <div className="flex w-full">
+        <div className="relative h-64 w-10 shrink-0" aria-hidden>
+          {[8, 50, 89].map((top) => (
+            <Skeleton
+              key={top}
+              className="absolute right-1.5 h-2.5 w-6 -translate-y-1/2"
+              style={{ top: `${top}%` }}
+            />
+          ))}
+        </div>
+        <ChartGrid className="h-64 min-w-0 flex-1">
         <svg
           viewBox="0 0 960 260"
           preserveAspectRatio="none"
@@ -137,6 +147,7 @@ export function TokenUsageSkeleton() {
           />
         </svg>
       </ChartGrid>
+      </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap gap-x-4 gap-y-1">

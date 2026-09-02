@@ -175,6 +175,10 @@ function TokenChart({ snapshot }: { snapshot: TokenSnapshot }) {
   const pad = { l: 12, r: 12, t: 8, b: 28 };
   const innerW = width - pad.l - pad.r;
   const innerH = height - pad.t - pad.b;
+  // Three ticks only: enough to read the scale, quiet enough not to compete
+  // with the series. Rendered as HTML so `preserveAspectRatio="none"` cannot
+  // stretch the figures the way it stretches the plot.
+  const axisTicks = [0, 0.5, 1] as const;
   // Lines are overlaid, not stacked — scale to the tallest series, not the
   // daily total, and leave ~10% of the plot above that peak.
   const peak = Math.max(
@@ -224,17 +228,29 @@ function TokenChart({ snapshot }: { snapshot: TokenSnapshot }) {
 
   return (
     <div className="space-y-3">
-      <div className="relative w-full">
-        <svg
-          viewBox={`0 0 ${width} ${height}`}
-          preserveAspectRatio="none"
-          className="h-64 w-full"
-          role="img"
-          aria-label="Token usage by provider"
-          onPointerMove={move}
-          onPointerLeave={() => setHover(null)}
-        >
-          {[0.25, 0.5, 0.75, 1].map((tick) => (
+      <div className="relative flex w-full">
+        <div className="relative h-64 w-10 shrink-0" aria-hidden>
+          {axisTicks.map((tick) => (
+            <span
+              key={tick}
+              className="absolute right-1.5 -translate-y-1/2 text-[10px] tabular-nums text-muted-foreground/55"
+              style={{ top: `${(yAt(max * tick) / height) * 100}%` }}
+            >
+              {formatTokenCount(max * tick)}
+            </span>
+          ))}
+        </div>
+        <div className="relative min-w-0 flex-1">
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            preserveAspectRatio="none"
+            className="h-64 w-full"
+            role="img"
+            aria-label="Token usage by provider"
+            onPointerMove={move}
+            onPointerLeave={() => setHover(null)}
+          >
+          {[0, 0.25, 0.5, 0.75, 1].map((tick) => (
             <line
               key={tick}
               x1={pad.l}
@@ -307,7 +323,8 @@ function TokenChart({ snapshot }: { snapshot: TokenSnapshot }) {
           >
             {snapshot.series.at(-1)?.label}
           </text>
-        </svg>
+          </svg>
+        </div>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
         <div className="flex flex-wrap gap-x-4 gap-y-1">
