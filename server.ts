@@ -4,7 +4,6 @@ import {
   PROVIDER_KEYS,
   assembleDashboard,
   formatDashboardText,
-  pickProviderLimitRaw,
   type DashboardSnapshot,
   type ProviderKey,
   type ProviderLimitSlice,
@@ -49,6 +48,7 @@ import {
   rememberGoodLimits,
   shouldReuseCachedLimits,
 } from "./lib/limits-cache";
+import { normalizeProviderLimits } from "./lib/provider-limits";
 
 const usageWindowSchema = z.object({
   label: z.string(),
@@ -246,13 +246,6 @@ export const rpcContract = defineRpcContract({
   },
 });
 
-function asLimitSlice(value: unknown): ProviderLimitSlice {
-  if (!value || typeof value !== "object") {
-    return { status: "error", message: "No usage data returned." };
-  }
-  return value as ProviderLimitSlice;
-}
-
 type LastGoodLimits = Partial<Record<ProviderKey, ProviderLimitSlice>>;
 
 type LastFetch = {
@@ -291,13 +284,7 @@ function createLimitStore(bb: BbPluginApi) {
 
   const readLive = async (hostId: string | null) => {
     const raw = await bb.sdk.system.usageLimits(hostId ? { hostId } : {});
-    const limitsRecord = raw as Record<string, unknown>;
-    const fresh = Object.fromEntries(
-      PROVIDER_KEYS.map((key) => [
-        key,
-        asLimitSlice(pickProviderLimitRaw(limitsRecord, key)),
-      ]),
-    ) as Record<ProviderKey, ProviderLimitSlice>;
+    const fresh = normalizeProviderLimits(raw);
     const limits = overlayLastGoodLimits(fresh, lastGood);
     lastGood = rememberGoodLimits(limits, lastGood);
     lastFetch = {
@@ -1015,7 +1002,7 @@ export default async function plugin(bb: BbPluginApi) {
         resolvedHostId = match.id;
       }
 
-      const snapshot = await loadDashboard(bb, resolvedHostId, limits);
+      const snapshot = await loadDashboard(bb, resolvedHostId, limits, force);
       const tokenSnapshot = await tokens.get(days, force);
       if (json) {
         return {
