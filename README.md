@@ -40,6 +40,15 @@ serving new requests rather than whichever login the CLI happens to hold. A
 pooled provider stays on the dashboard even when the host reports nothing for
 its local credentials, which is the normal state once routing is on.
 
+The host and the provider's own CLI can only describe one login: the account
+this machine is signed into. That account keeps its named windows — Codex's
+per-model buckets and cost-backed periods among them — and is marked "signed in
+here"; the other accounts show what the pool knows, which is coarser but is the
+only view of a login this machine never held. A window the pool cannot yet name
+or time is left out rather than drawn as a full one, because the pool posts a
+slot as soon as a response header mentions it, before it knows the window's
+length or when it turns over.
+
 Accounts are read from `bb pool status --json` on the machine bb runs on, so
 nothing here touches the pool's stored tokens. Providers are matched by the
 pooler's own names (`codex`, `claude`), and a provider whose routing switch is

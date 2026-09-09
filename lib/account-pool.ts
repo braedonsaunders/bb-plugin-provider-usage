@@ -91,16 +91,22 @@ function windowsFromLimitRows(rows: unknown): UsageWindow[] {
     if (!row) continue;
     const usedPercent = utilizationPercent(row.utilization);
     if (usedPercent === null) continue;
+    const minutes = finiteNumber(row.windowMinutes);
+    const resetsAt = isoTimestamp(row.resetAt);
+    /**
+     * The pool posts a slot as soon as a response header mentions it, before it
+     * knows the window's length or when it turns over — `windowMinutes: null`
+     * with `resetAt: 0`. Charting that as "Secondary limit · 100% left" reads as
+     * a full window when the truth is that nothing is known about it yet, so a
+     * window the pool cannot name or time is left out until it can.
+     */
+    if (minutes === null && resetsAt === null) continue;
     const slot = nonEmptyString(row.slot);
     const fallback = slot
       ? `${slot[0]!.toUpperCase()}${slot.slice(1)} limit`
       : "Limit";
     windows.push(
-      toWindow(
-        usedPercent,
-        formatWindowDurationLabel(finiteNumber(row.windowMinutes), fallback),
-        isoTimestamp(row.resetAt),
-      ),
+      toWindow(usedPercent, formatWindowDurationLabel(minutes, fallback), resetsAt),
     );
   }
   return windows;
@@ -172,6 +178,9 @@ export function normalizeAccountPool(
       status,
       unavailable:
         status !== "ready" || (heldUntil !== null && heldUntil > nowMs),
+      // Resolved against the host's signed-in account when the dashboard is
+      // assembled; the pool itself has no view of which login the CLI holds.
+      local: false,
       windows,
       message: nonEmptyString(account.error),
     });

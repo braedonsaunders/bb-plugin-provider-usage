@@ -127,6 +127,12 @@ export interface ProviderAccountUsage {
   status: string;
   /** True once the pool has skipped this account for new requests. */
   unavailable: boolean;
+  /**
+   * True for the account this machine's provider CLI is signed into. That is
+   * the one account the host and the provider's own tooling can describe in
+   * full, so its windows are the named ones rather than the pool's summary.
+   */
+  local: boolean;
   windows: UsageWindow[];
   message: string | null;
 }
@@ -469,6 +475,29 @@ export function assembleDashboard(input: {
     const supplement = input.supplements?.[key];
     const accounts = input.pool?.[key] ?? [];
     const identity = resolveCatalog(key, input.catalog);
+    const windows =
+      slice.status === "ok"
+        ? mergeWindows(slice.windows, supplement?.windows)
+        : [];
+    /**
+     * The host and the provider's own CLI describe a single login: the one this
+     * machine is signed into. Give that account its named windows — Codex's
+     * per-model buckets and cost-backed periods among them — and leave the
+     * other accounts with what the pool knows, which is coarser but is the only
+     * view of a login this machine never held.
+     */
+    const localEmail = slice.accountEmail?.trim().toLowerCase() ?? null;
+    const resolvedAccounts = accounts.map((account) => {
+      const isLocal =
+        localEmail !== null &&
+        account.email?.trim().toLowerCase() === localEmail;
+      if (!isLocal) return account;
+      return {
+        ...account,
+        local: true,
+        windows: windows.length > 0 ? windows : account.windows,
+      };
+    });
     return {
       key,
       id: PROVIDER_META[key].id,
@@ -478,17 +507,14 @@ export function assembleDashboard(input: {
       accountEmail: slice.accountEmail ?? null,
       planLabel: slice.planLabel ?? null,
       message: slice.message ?? null,
-      windows:
-        slice.status === "ok"
-          ? mergeWindows(slice.windows, supplement?.windows)
-          : [],
+      windows,
       credits: slice.status === "ok" ? (supplement?.credits ?? null) : null,
       spendControl:
         slice.status === "ok" ? (supplement?.spendControl ?? null) : null,
       resetCredits:
         slice.status === "ok" ? (supplement?.resetCredits ?? null) : null,
-      pooled: accounts.length > 0,
-      accounts,
+      pooled: resolvedAccounts.length > 0,
+      accounts: resolvedAccounts,
     } satisfies ProviderUsage;
   });
 
@@ -550,15 +576,23 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
     // host's view of the local login can be unauthenticated while the pool is
     // serving requests perfectly well from another account.
     for (const account of provider.accounts) {
-      const state = account.unavailable ? ` · ${account.status}` : "";
-      lines.push(`  ${account.label}${state}`);
+      const state = [
+        account.unavailable ? account.status : null,
+        account.local ? "signed in here" : null,
+      ].filter(Boolean);
+      lines.push(
+        `  ${account.label}${state.length > 0 ? ` · ${state.join(" · ")}` : ""}`,
+      );
       if (account.message) lines.push(`    ${account.message}`);
       for (const window of account.windows) {
+        const cost = window.cost
+          ? ` · ${formatUsdCents(window.cost.usedUsdCents)} / ${formatUsdCents(window.cost.limitUsdCents)}`
+          : "";
         const reset = window.resetsAt
           ? ` · resets ${formatResetAbsolute(window.resetsAt)} (in ${formatResetRelative(window.resetsAt)})`
           : "";
         lines.push(
-          `    ${window.label.padEnd(16)} ${formatPercent(window.remainingPercent)} left · ${formatPercent(window.usedPercent)} used${reset}`,
+          `    ${window.label.padEnd(16)} ${formatPercent(window.remainingPercent)} left · ${formatPercent(window.usedPercent)} used${cost}${reset}`,
         );
       }
       if (account.windows.length === 0) {
@@ -569,11 +603,13 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
       lines.push(`  ${statusLabel(provider.status)}${provider.message ? ` — ${provider.message}` : ""}`);
       continue;
     }
-    if (provider.windows.length === 0) {
+    // A pooled provider has already listed these windows under the account they
+    // describe, so repeating them at provider level would double the report.
+    if (!provider.pooled && provider.windows.length === 0) {
       lines.push("  No subscription windows reported");
       continue;
     }
-    for (const window of provider.windows) {
+    for (const window of provider.pooled ? [] : provider.windows) {
       const cost = window.cost
         ? ` · ${formatUsdCents(window.cost.usedUsdCents)} / ${formatUsdCents(window.cost.limitUsdCents)}`
         : "";

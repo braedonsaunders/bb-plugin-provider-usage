@@ -116,6 +116,7 @@ const providerUsageSchema = z.object({
       priority: z.number(),
       status: z.string(),
       unavailable: z.boolean(),
+      local: z.boolean(),
       windows: z.array(usageWindowSchema),
       message: z.string().nullable(),
     }),

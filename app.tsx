@@ -530,6 +530,11 @@ function PoolAccounts({ accounts }: { accounts: ProviderAccountUsage[] }) {
           <div className="flex items-baseline justify-between gap-3">
             <p className="min-w-0 truncate text-sm font-medium">
               {account.label}
+              {account.local ? (
+                <span className="ml-2 font-normal text-xs text-muted-foreground">
+                  signed in here
+                </span>
+              ) : null}
             </p>
             <p
               className={cn(
@@ -554,7 +559,9 @@ function PoolAccounts({ accounts }: { accounts: ProviderAccountUsage[] }) {
             ))
           ) : (
             <p className="text-xs text-muted-foreground">
-              No limit windows reported yet.
+              {account.local
+                ? "Signed in on this machine, but no limit window was reported."
+                : "The pool has not seen a limit window for this account yet."}
             </p>
           )}
         </div>

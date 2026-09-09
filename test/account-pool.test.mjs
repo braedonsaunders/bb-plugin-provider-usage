@@ -114,6 +114,71 @@ test("an account held by a temporary rate limit counts as unavailable", () => {
   assert.equal(expired.codex[1].unavailable, false);
 });
 
+test("a slot the pool cannot name or time is not charted", () => {
+  const status = poolStatus();
+  // What the pool posts after a response header mentions a slot it knows
+  // nothing else about: no length, no reset, and a zero that is not "empty".
+  status.accounts[1].limitWindows.push({
+    slot: "secondary",
+    windowMinutes: null,
+    utilization: 0,
+    resetAt: 0,
+    status: null,
+    source: "header",
+  });
+  const pool = normalizeAccountPool(status);
+  assert.equal(pool.codex[1].windows.length, 1);
+  assert.equal(pool.codex[1].windows[0].label, "Weekly limit");
+
+  // A slot with a real reset is still worth showing, even unnamed.
+  status.accounts[1].limitWindows[1].resetAt = RESET_MS;
+  const timed = normalizeAccountPool(status);
+  assert.equal(timed.codex[1].windows.length, 2);
+  assert.equal(timed.codex[1].windows[1].label, "Secondary limit");
+});
+
+test("the locally signed-in account keeps its named windows", () => {
+  const snapshot = assembleDashboard({
+    limits: {
+      codex: {
+        status: "ok",
+        accountEmail: "work@example.com",
+        windows: [
+          { label: "Weekly limit", usedPercent: 100, resetsAt: null },
+          {
+            label: "GPT-5.3-Codex-Spark · 5-hour limit",
+            usedPercent: 10,
+            resetsAt: null,
+          },
+        ],
+      },
+      claudeCode: { status: "not_installed" },
+      cursor: { status: "not_installed" },
+      muse: { status: "not_installed" },
+    },
+    pool: normalizeAccountPool(poolStatus()),
+    hosts: [],
+    catalog: [{ id: "codex", displayName: "Codex", logoUrl: null }],
+    hostId: null,
+  });
+
+  const codex = snapshot.providers.find((provider) => provider.key === "codex");
+  const [local, remote] = codex.accounts;
+  assert.equal(local.local, true);
+  assert.equal(remote.local, false);
+  // The host names the local account's buckets; the pool only knew one window.
+  assert.deepEqual(
+    local.windows.map((window) => window.label),
+    ["Weekly limit", "GPT-5.3-Codex-Spark · 5-hour limit"],
+  );
+  assert.equal(remote.windows.length, 1);
+
+  // Those windows belong to the account row now, not to the provider as well.
+  const text = formatDashboardText(snapshot);
+  assert.equal(text.match(/GPT-5\.3-Codex-Spark/g).length, 1);
+  assert.match(text, /work@example\.com · exhausted · signed in here/);
+});
+
 test("flat window fields are read only when limitWindows is absent", () => {
   const status = poolStatus();
   status.accounts[1].fiveHourUtilization = 0.5;
