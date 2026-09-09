@@ -179,6 +179,103 @@ test("the locally signed-in account keeps its named windows", () => {
   assert.match(text, /work@example\.com · exhausted · signed in here/);
 });
 
+test("one limit read twice, seconds apart, is listed once", () => {
+  const snapshot = assembleDashboard({
+    limits: {
+      codex: {
+        status: "ok",
+        accountEmail: "work@example.com",
+        // The host's reading of the weekly window.
+        windows: [
+          {
+            label: "Weekly limit",
+            usedPercent: 100,
+            resetsAt: "2026-09-15T01:46:56.000Z",
+          },
+        ],
+      },
+      claudeCode: { status: "not_installed" },
+      cursor: { status: "not_installed" },
+      muse: { status: "not_installed" },
+    },
+    supplements: {
+      codex: {
+        // The same window from the provider's CLI, read two seconds earlier.
+        windows: [
+          {
+            label: "Weekly limit",
+            usedPercent: 100,
+            resetsAt: "2026-09-15T01:46:54.000Z",
+          },
+          {
+            label: "GPT-5.3-Codex-Spark · 5-hour limit",
+            usedPercent: 0,
+            resetsAt: "2026-09-09T06:03:02.000Z",
+          },
+        ],
+        credits: null,
+        spendControl: null,
+        resetCredits: null,
+      },
+    },
+    pool: normalizeAccountPool(poolStatus()),
+    hosts: [],
+    catalog: [{ id: "codex", displayName: "Codex", logoUrl: null }],
+    hostId: null,
+  });
+
+  const codex = snapshot.providers.find((provider) => provider.key === "codex");
+  assert.deepEqual(
+    codex.windows.map((window) => window.label),
+    ["Weekly limit", "GPT-5.3-Codex-Spark · 5-hour limit"],
+  );
+  assert.deepEqual(
+    codex.accounts[0].windows.map((window) => window.label),
+    ["Weekly limit", "GPT-5.3-Codex-Spark · 5-hour limit"],
+  );
+});
+
+test("a genuinely different window of the same name still lists", () => {
+  const snapshot = assembleDashboard({
+    limits: {
+      codex: {
+        status: "ok",
+        windows: [
+          {
+            label: "Weekly limit",
+            usedPercent: 100,
+            resetsAt: "2026-09-15T01:46:56.000Z",
+          },
+        ],
+      },
+      claudeCode: { status: "not_installed" },
+      cursor: { status: "not_installed" },
+      muse: { status: "not_installed" },
+    },
+    supplements: {
+      codex: {
+        // A week away: a different window that happens to share a name.
+        windows: [
+          {
+            label: "Weekly limit",
+            usedPercent: 0,
+            resetsAt: "2026-09-22T01:46:56.000Z",
+          },
+        ],
+        credits: null,
+        spendControl: null,
+        resetCredits: null,
+      },
+    },
+    hosts: [],
+    catalog: [{ id: "codex", displayName: "Codex", logoUrl: null }],
+    hostId: null,
+  });
+
+  const codex = snapshot.providers.find((provider) => provider.key === "codex");
+  assert.equal(codex.windows.length, 2);
+});
+
 test("flat window fields are read only when limitWindows is absent", () => {
   const status = poolStatus();
   status.accounts[1].fiveHourUtilization = 0.5;

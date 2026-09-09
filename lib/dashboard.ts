@@ -332,19 +332,42 @@ function normalizeWindows(
   });
 }
 
+/**
+ * The host and the provider's own CLI read the same window moments apart, so
+ * the two reports of one limit routinely disagree on its reset by a second or
+ * two and on its percentage by a rounding step. Matching those exactly listed
+ * the same limit twice; a window is the same window when it has the same name
+ * and turns over at about the same time.
+ */
+const SAME_WINDOW_MS = 2 * 60 * 1000;
+
+function isSameWindow(current: UsageWindow, next: UsageWindow): boolean {
+  if (current.label.toLocaleLowerCase() !== next.label.toLocaleLowerCase()) {
+    return false;
+  }
+  if (current.resetsAt === null || next.resetsAt === null) {
+    return current.resetsAt === next.resetsAt;
+  }
+  const drift = Math.abs(
+    Date.parse(current.resetsAt) - Date.parse(next.resetsAt),
+  );
+  return Number.isFinite(drift) && drift <= SAME_WINDOW_MS;
+}
+
 function mergeWindows(
   reported: ProviderLimitSlice["windows"] | undefined,
   supplemental: ProviderLimitSlice["windows"] | undefined,
 ): UsageWindow[] {
   const merged = normalizeWindows(reported);
   for (const next of normalizeWindows(supplemental)) {
-    const duplicate = merged.some(
-      (current) =>
-        current.label.toLocaleLowerCase() === next.label.toLocaleLowerCase() &&
-        current.resetsAt === next.resetsAt &&
-        Math.abs(current.usedPercent - next.usedPercent) < 0.01,
-    );
-    if (!duplicate) merged.push(next);
+    // The richer source wins the tie: a supplemental read carries cost detail
+    // the host's summary does not, and is the reason to consult it at all.
+    const existing = merged.findIndex((current) => isSameWindow(current, next));
+    if (existing < 0) {
+      merged.push(next);
+    } else if (next.cost && !merged[existing]!.cost) {
+      merged[existing] = next;
+    }
   }
   return merged;
 }

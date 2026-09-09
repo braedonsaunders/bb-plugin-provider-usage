@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type PointerEvent } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { RefreshIcon } from "@hugeicons/core-free-icons";
+import { ArrowDown01Icon, RefreshIcon } from "@hugeicons/core-free-icons";
 import type { rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import {
@@ -507,46 +507,127 @@ function Gauge({
  */
 function heroWindow(provider: ProviderUsage): UsageWindow | undefined {
   if (!provider.pooled) return provider.windows[0];
-  const active =
+  const serving =
     provider.accounts.find((account) => !account.unavailable) ??
     provider.accounts[0];
-  return active?.windows[0];
+  // The ring answers "how much is left before work stops", which for a pooled
+  // provider is the tightest window of the account about to take that work.
+  return tightestWindow(serving?.windows);
 }
 
+/** The window that decides an account's fate: whichever has least left. */
+function tightestWindow(
+  windows: UsageWindow[] | undefined,
+): UsageWindow | undefined {
+  if (!windows || windows.length === 0) return undefined;
+  return windows.reduce((tightest, window) =>
+    window.remainingPercent < tightest.remainingPercent ? window : tightest,
+  );
+}
+
+type AccountRole = "serving" | "standby" | "unavailable";
+
+function accountRole(
+  account: ProviderAccountUsage,
+  servingId: string | null,
+): AccountRole {
+  if (account.id === servingId) return "serving";
+  return account.unavailable ? "unavailable" : "standby";
+}
+
+const ROLE_LABEL: Record<AccountRole, string> = {
+  serving: "Serving now",
+  standby: "Standby",
+  unavailable: "Unavailable",
+};
+
 /**
- * Each pooled account, in the order the pool will fail over through them. The
- * account serving new requests is the first one still available, so it is
- * marked rather than left for the reader to work out from the statuses.
+ * One pooled account, collapsed to the line that answers "can this account
+ * take work?" and expanded to the windows behind that answer. The account
+ * serving new requests opens by default, because it is the only one whose
+ * numbers describe the next request.
  */
-function PoolAccounts({ accounts }: { accounts: ProviderAccountUsage[] }) {
-  const activeId = accounts.find((account) => !account.unavailable)?.id ?? null;
+function PoolAccountRow({
+  account,
+  role,
+  provider,
+  open,
+  onToggle,
+}: {
+  account: ProviderAccountUsage;
+  role: AccountRole;
+  provider: ProviderUsage;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const tightest = tightestWindow(account.windows);
+  const tone = tightest ? remainingTone(tightest.remainingPercent) : null;
+  const statusText =
+    role === "unavailable" ? account.status : ROLE_LABEL[role];
+  // Provider-wide extras (credits, banked resets, on-demand spend) are read
+  // from the local login, so they belong to that account rather than floating
+  // underneath the pool as though they covered every account in it.
+  const showsProviderDetail =
+    account.local &&
+    Boolean(provider.credits ?? provider.resetCredits ?? provider.spendControl);
+
   return (
-    <div className="space-y-3 rounded-lg border border-border/60 p-3">
-      <p className="text-xs font-medium text-muted-foreground">
-        Pooled accounts · {accounts.length}
-      </p>
-      {accounts.map((account) => (
-        <div key={account.id} className="space-y-2">
-          <div className="flex items-baseline justify-between gap-3">
-            <p className="min-w-0 truncate text-sm font-medium">
+    <div className="first:rounded-t-lg last:rounded-b-lg [&:not(:last-child)]:border-b border-border/60">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/40"
+      >
+        <span
+          aria-hidden
+          className={cn(
+            "size-2 shrink-0 rounded-full",
+            role === "serving"
+              ? "bg-emerald-500"
+              : role === "standby"
+                ? "bg-muted-foreground/40"
+                : "bg-destructive/70",
+          )}
+        />
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-2">
+            <span className="truncate text-sm font-medium">
               {account.label}
-              {account.local ? (
-                <span className="ml-2 font-normal text-xs text-muted-foreground">
-                  signed in here
-                </span>
-              ) : null}
-            </p>
-            <p
-              className={cn(
-                "shrink-0 text-xs font-medium",
-                account.id === activeId
-                  ? "text-foreground"
-                  : "text-muted-foreground",
-              )}
-            >
-              {account.id === activeId ? "Serving new requests" : account.status}
-            </p>
-          </div>
+            </span>
+            {account.local ? (
+              <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                this machine
+              </span>
+            ) : null}
+          </span>
+          <span className="block truncate text-xs text-muted-foreground">
+            {statusText}
+            {tightest ? ` · ${tightest.label}` : ""}
+          </span>
+        </span>
+        {tightest ? (
+          <span
+            className={cn(
+              "shrink-0 text-sm font-semibold tabular-nums",
+              toneText(tone!),
+            )}
+          >
+            {formatPercent(tightest.remainingPercent)}
+          </span>
+        ) : (
+          <span className="shrink-0 text-xs text-muted-foreground">—</span>
+        )}
+        <HugeiconsIcon
+          icon={ArrowDown01Icon}
+          className={cn(
+            "size-4 shrink-0 text-muted-foreground transition-transform",
+            open && "rotate-180",
+          )}
+        />
+      </button>
+      {open ? (
+        <div className="space-y-4 pb-4 pl-8 pr-3 pt-1">
           {account.message ? (
             <p className="text-xs text-destructive">{account.message}</p>
           ) : null}
@@ -558,14 +639,66 @@ function PoolAccounts({ accounts }: { accounts: ProviderAccountUsage[] }) {
               />
             ))
           ) : (
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               {account.local
                 ? "Signed in on this machine, but no limit window was reported."
                 : "The pool has not seen a limit window for this account yet."}
             </p>
           )}
+          {showsProviderDetail ? <ProviderDetails provider={provider} /> : null}
         </div>
-      ))}
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The pool as an overview: what it is routing across, how much of it is still
+ * available, and one row per account in failover order. Detail stays folded
+ * away until asked for, because the question this pane usually answers is
+ * simply whether there is capacity left somewhere.
+ */
+function PoolAccounts({ provider }: { provider: ProviderUsage }) {
+  const accounts = provider.accounts;
+  const servingId =
+    accounts.find((account) => !account.unavailable)?.id ?? null;
+  const [openIds, setOpenIds] = useState<readonly string[]>(() =>
+    servingId ? [servingId] : accounts.slice(0, 1).map((row) => row.id),
+  );
+  const availableCount = accounts.filter(
+    (account) => !account.unavailable,
+  ).length;
+
+  const toggle = useCallback((id: string) => {
+    setOpenIds((current) =>
+      current.includes(id)
+        ? current.filter((row) => row !== id)
+        : [...current, id],
+    );
+  }, []);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="text-xs font-medium text-muted-foreground">
+          Pooled across {accounts.length} accounts
+        </p>
+        <p className="text-xs text-muted-foreground tabular-nums">
+          {availableCount} of {accounts.length} available
+        </p>
+      </div>
+      <div className="rounded-lg border border-border/60">
+        {accounts.map((account) => (
+          <PoolAccountRow
+            key={account.id}
+            account={account}
+            role={accountRole(account, servingId)}
+            provider={provider}
+            open={openIds.includes(account.id)}
+            onToggle={() => toggle(account.id)}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -809,7 +942,7 @@ function ProviderLimitsSection({
                       {[
                         provider.planLabel,
                         provider.pooled
-                          ? `${provider.accounts.length} pooled accounts`
+                          ? `${provider.accounts.length} accounts`
                           : provider.accountEmail,
                         provider.pooled ? null : statusLabel(provider.status),
                       ]
@@ -823,7 +956,7 @@ function ProviderLimitsSection({
                 </div>
                 <div className="min-w-0 flex-1 space-y-4">
                   {provider.pooled ? (
-                    <PoolAccounts accounts={provider.accounts} />
+                    <PoolAccounts provider={provider} />
                   ) : provider.status === "ok" &&
                     provider.windows.length > 0 ? (
                     provider.windows.map((window, index) => (
@@ -844,7 +977,7 @@ function ProviderLimitsSection({
                             : provider.message ?? "Usage is unavailable right now."}
                     </p>
                   )}
-                  {provider.status === "ok" ? (
+                  {provider.status === "ok" && !provider.pooled ? (
                     <ProviderDetails provider={provider} />
                   ) : null}
                 </div>

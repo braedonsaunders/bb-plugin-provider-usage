@@ -34,11 +34,16 @@ Codex backend reports.
 **Pooled accounts.** When the Account Pooler routes a provider across several
 logins, one meter per provider stops describing what the next request will get:
 the account at the front of the failover order can be exhausted while the pool
-as a whole is fine. Such a provider expands into one meter per enabled account,
-in failover order, and the provider's ring follows the account that is actually
-serving new requests rather than whichever login the CLI happens to hold. A
-pooled provider stays on the dashboard even when the host reports nothing for
-its local credentials, which is the normal state once routing is on.
+as a whole is fine. Such a provider becomes an overview instead of a stack of
+bars: one row per enabled account in failover order, each collapsed to the line
+that answers "can this account take work?" — whether it is serving, on standby
+or unavailable, and how much its tightest window has left. Opening a row shows
+the windows behind that answer. The account serving new requests opens by
+default, since it is the only one whose numbers describe the next request, and
+the provider's ring follows it rather than whichever login the CLI happens to
+hold. A pooled provider stays on the dashboard even when the host reports
+nothing for its local credentials, which is the normal state once routing is
+on.
 
 The host and the provider's own CLI can only describe one login: the account
 this machine is signed into. That account keeps its named windows — Codex's
