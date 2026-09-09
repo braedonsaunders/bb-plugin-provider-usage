@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import test from "node:test";
 import { tmpdir } from "node:os";
@@ -485,5 +485,171 @@ test("cursor scan skips a full reread when blob identity is unchanged", async ()
     assert.equal(second[0].blobCount, first[0].blobCount);
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a deleted transcript keeps the days it already contributed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "provider-usage-retain-"));
+  const codexHome = join(root, "codex");
+  const claudeHome = join(root, "claude");
+  const codexSessions = join(codexHome, "sessions");
+  const claudeProject = join(claudeHome, "projects", "project");
+  await mkdir(codexSessions, { recursive: true });
+  await mkdir(claudeProject, { recursive: true });
+  const timestamp = new Date().toISOString();
+  const today = dayKey(Date.now());
+
+  const livePath = join(codexSessions, "live.jsonl");
+  const deletedPath = join(codexSessions, "pruned.jsonl");
+  const codexLine = (total) =>
+    JSON.stringify({
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            total_tokens: total,
+            input_tokens: total - 100,
+            cached_input_tokens: total - 300,
+            output_tokens: 100,
+            reasoning_output_tokens: 40,
+          },
+        },
+      },
+    });
+  await writeFile(livePath, `${codexLine(1_000)}\n`);
+  await writeFile(deletedPath, `${codexLine(5_000)}\n`);
+
+  // A Claude response the deleted file and a surviving file both recorded: the
+  // ledger must not let the replay count it twice.
+  const claudeLine = JSON.stringify({
+    timestamp,
+    type: "assistant",
+    message: {
+      id: "msg-shared",
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 800,
+        cache_creation_input_tokens: 0,
+      },
+    },
+  });
+  const claudeLive = join(claudeProject, "parent.jsonl");
+  const claudeGone = join(claudeProject, "gone.jsonl");
+  await writeFile(claudeLive, `${claudeLine}\n`);
+  await writeFile(claudeGone, `${claudeLine}\n`);
+
+  const priorCodexHome = process.env.CODEX_HOME;
+  const priorClaudeHome = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CODEX_HOME = codexHome;
+  process.env.CLAUDE_CONFIG_DIR = claudeHome;
+  try {
+    const ledger = new Map();
+    const first = await scanTokenFiles({
+      includeCursor: false,
+      includeOpencode: false,
+      retained: ledger,
+    });
+    for (const file of first.files) {
+      ledger.set(file.path, {
+        mtimeMs: file.mtimeMs,
+        size: file.size,
+        provider: file.provider,
+        daily: file.daily,
+        ...(file.keyedEvents ? { keyedEvents: file.keyedEvents } : {}),
+      });
+    }
+    assert.equal(first.daily[today]?.codex.tokens, 6_000);
+    assert.equal(first.daily[today]?.["claude-code"].tokens, 920);
+    assert.equal(first.retainedFiles, 0);
+
+    await rm(deletedPath);
+    await rm(claudeGone);
+
+    // A forced reparse must not be a forgetting pass either.
+    const second = await scanTokenFiles({
+      includeCursor: false,
+      includeOpencode: false,
+      cached: new Map(),
+      retained: ledger,
+    });
+    assert.equal(second.daily[today]?.codex.tokens, 6_000);
+    assert.equal(second.daily[today]?.["claude-code"].tokens, 920);
+    assert.equal(second.retainedFiles, 2);
+  } finally {
+    if (priorCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = priorCodexHome;
+    if (priorClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = priorClaudeHome;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a session that outgrows the parse cap keeps its last known totals", async () => {
+  const root = await mkdtemp(join(tmpdir(), "provider-usage-cap-"));
+  const codexSessions = join(root, "codex", "sessions");
+  await mkdir(codexSessions, { recursive: true });
+  const timestamp = new Date().toISOString();
+  const today = dayKey(Date.now());
+  const path = join(codexSessions, "huge.jsonl");
+  await writeFile(
+    path,
+    `${JSON.stringify({
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            total_tokens: 7_000,
+            input_tokens: 6_900,
+            cached_input_tokens: 6_700,
+            output_tokens: 100,
+            reasoning_output_tokens: 40,
+          },
+        },
+      },
+    })}\n`,
+  );
+
+  const priorCodexHome = process.env.CODEX_HOME;
+  const priorClaudeHome = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CODEX_HOME = join(root, "codex");
+  process.env.CLAUDE_CONFIG_DIR = join(root, "claude");
+  try {
+    const ledger = new Map();
+    const first = await scanTokenFiles({
+      includeCursor: false,
+      includeOpencode: false,
+      retained: ledger,
+    });
+    assert.equal(first.daily[today]?.codex.tokens, 7_000);
+    for (const file of first.files) {
+      ledger.set(file.path, {
+        mtimeMs: file.mtimeMs,
+        size: file.size,
+        provider: file.provider,
+        daily: file.daily,
+      });
+    }
+
+    // Grow it past the cap. The scan may decline to reparse, but declining to
+    // parse must not mean reporting zero for days already counted.
+    await appendFile(path, `${"x".repeat(2048)}\n`);
+    const second = await scanTokenFiles({
+      includeCursor: false,
+      includeOpencode: false,
+      retained: ledger,
+      maxFileBytes: 1024,
+    });
+    assert.equal(second.daily[today]?.codex.tokens, 7_000);
+  } finally {
+    if (priorCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = priorCodexHome;
+    if (priorClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = priorClaudeHome;
+    await rm(root, { recursive: true, force: true });
   }
 });

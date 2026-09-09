@@ -21,6 +21,7 @@ import {
   remainingTone,
   statusLabel,
   type DashboardSnapshot,
+  type ProviderAccountUsage,
   type ProviderUsage,
   type RemainingTone,
   type UsageWindow,
@@ -430,6 +431,9 @@ function TokenUsageSection() {
             )}
             <p className="text-xs text-muted-foreground">
               {data.fileCount} session files
+              {data.retainedFiles > 0
+                ? ` · ${data.retainedFiles} kept after deletion`
+                : ""}
               {data.changedFiles > 0 ? ` · ${data.changedFiles} updated` : ""}
               {data.sources.length > 0 ? ` · ${data.sources.join(", ")}` : ""}
             </p>
@@ -496,6 +500,69 @@ function Gauge({
  * states its own limits — a bar that filled as you spent would say the
  * opposite of the "% left" printed next to it.
  */
+/**
+ * The window a provider's gauge should show. For a pooled provider that is the
+ * account which will serve the next request: the host still reports the local
+ * login's quota, which can read empty while the pool is routing elsewhere.
+ */
+function heroWindow(provider: ProviderUsage): UsageWindow | undefined {
+  if (!provider.pooled) return provider.windows[0];
+  const active =
+    provider.accounts.find((account) => !account.unavailable) ??
+    provider.accounts[0];
+  return active?.windows[0];
+}
+
+/**
+ * Each pooled account, in the order the pool will fail over through them. The
+ * account serving new requests is the first one still available, so it is
+ * marked rather than left for the reader to work out from the statuses.
+ */
+function PoolAccounts({ accounts }: { accounts: ProviderAccountUsage[] }) {
+  const activeId = accounts.find((account) => !account.unavailable)?.id ?? null;
+  return (
+    <div className="space-y-3 rounded-lg border border-border/60 p-3">
+      <p className="text-xs font-medium text-muted-foreground">
+        Pooled accounts · {accounts.length}
+      </p>
+      {accounts.map((account) => (
+        <div key={account.id} className="space-y-2">
+          <div className="flex items-baseline justify-between gap-3">
+            <p className="min-w-0 truncate text-sm font-medium">
+              {account.label}
+            </p>
+            <p
+              className={cn(
+                "shrink-0 text-xs font-medium",
+                account.id === activeId
+                  ? "text-foreground"
+                  : "text-muted-foreground",
+              )}
+            >
+              {account.id === activeId ? "Serving new requests" : account.status}
+            </p>
+          </div>
+          {account.message ? (
+            <p className="text-xs text-destructive">{account.message}</p>
+          ) : null}
+          {account.windows.length > 0 ? (
+            account.windows.map((window, index) => (
+              <UsageBar
+                key={`${window.label}-${window.resetsAt ?? index}`}
+                window={window}
+              />
+            ))
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No limit windows reported yet.
+            </p>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function UsageBar({ window }: { window: UsageWindow }) {
   const tone = remainingTone(window.remainingPercent);
   const detail = [
@@ -716,7 +783,7 @@ function ProviderLimitsSection({
           </div>
         ) : data ? (
           data.providers.map((provider) => {
-            const hero = provider.windows[0];
+            const hero = heroWindow(provider);
             return (
               <div
                 key={provider.id}
@@ -734,8 +801,10 @@ function ProviderLimitsSection({
                     <p className="truncate text-xs text-muted-foreground">
                       {[
                         provider.planLabel,
-                        provider.accountEmail,
-                        statusLabel(provider.status),
+                        provider.pooled
+                          ? `${provider.accounts.length} pooled accounts`
+                          : provider.accountEmail,
+                        provider.pooled ? null : statusLabel(provider.status),
                       ]
                         .filter(Boolean)
                         .join(" · ")}
@@ -746,7 +815,10 @@ function ProviderLimitsSection({
                   ) : null}
                 </div>
                 <div className="min-w-0 flex-1 space-y-4">
-                  {provider.status === "ok" && provider.windows.length > 0 ? (
+                  {provider.pooled ? (
+                    <PoolAccounts accounts={provider.accounts} />
+                  ) : provider.status === "ok" &&
+                    provider.windows.length > 0 ? (
                     provider.windows.map((window, index) => (
                       <UsageBar
                         key={`${window.label}-${window.resetsAt ?? index}`}
@@ -853,7 +925,7 @@ function HomepageUsage() {
   return (
     <div className="grid gap-3 sm:grid-cols-3">
       {cards.map((provider) => {
-        const hero = provider.windows[0];
+        const hero = heroWindow(provider);
         return (
           <Card key={provider.id} className="shadow-none">
             <CardContent className="flex items-center gap-3 p-4">

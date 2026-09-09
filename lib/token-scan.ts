@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { createInterface } from "node:readline";
 import {
   isCursorStorePath,
@@ -26,6 +26,8 @@ export interface FileScanResult {
   path: string;
   mtimeMs: number;
   size: number;
+  /** Which provider's transcript this was, so a since-deleted file still counts. */
+  provider?: string;
   daily: Record<string, TokenBucket>;
   keyedEvents?: Record<string, TokenEvent>;
   blobCount?: number;
@@ -35,6 +37,7 @@ export interface FileScanResult {
 export type FileCacheEntry = {
   mtimeMs: number;
   size: number;
+  provider?: string;
   daily: Record<string, TokenBucket>;
   keyedEvents?: Record<string, TokenEvent>;
   blobCount?: number;
@@ -47,7 +50,13 @@ export interface TokenEvent {
 }
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
-const MAX_FILE_BYTES = 80 * 1024 * 1024;
+/**
+ * Parsing is streamed line by line, so size costs time rather than memory: a
+ * 326 MB rollout reads in well under a second. The cap only exists to stop a
+ * pathological file from stalling a scan, and a file above it keeps whatever
+ * total was last parsed instead of dropping out of history.
+ */
+const MAX_FILE_BYTES = 1024 * 1024 * 1024;
 
 function asNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -265,6 +274,27 @@ export function tokenRoots(home = homedir(), env = process.env): {
   return roots;
 }
 
+/**
+ * Which provider a cached path belonged to. Cache rows written before the
+ * provider was recorded, or written under a `CODEX_HOME`/`CLAUDE_CONFIG_DIR`
+ * that has since moved, still resolve from the on-disk layout.
+ */
+export function providerForPath(
+  path: string,
+  home = homedir(),
+  env = process.env,
+): string | null {
+  if (isCursorStorePath(path)) return "cursor";
+  if (isOpencodeStorePath(path)) return "opencode";
+  for (const root of tokenRoots(home, env)) {
+    if (path.startsWith(`${root.root}${sep}`)) return root.id;
+  }
+  if (path.includes(`${sep}.codex${sep}sessions${sep}`)) return "codex";
+  if (path.includes(`${sep}.claude${sep}projects${sep}`)) return "claude-code";
+  if (path.includes(`${sep}muse${sep}sessions${sep}`)) return "muse";
+  return null;
+}
+
 function bucketDelta(current: TokenBucket, previous: TokenBucket): TokenBucket {
   const delta = (next: number, prior: number) =>
     next < prior ? Math.max(0, next) : next - prior;
@@ -390,22 +420,54 @@ export async function scanTokenFiles(options?: {
   includeCursor?: boolean;
   includeOpencode?: boolean;
   cached?: Map<string, FileCacheEntry>;
+  /**
+   * The persisted ledger, consulted for files that are no longer on disk. Kept
+   * separate from `cached` so a forced reparse still keeps deleted history.
+   */
+  retained?: Map<string, FileCacheEntry>;
+  home?: string;
+  maxFileBytes?: number;
 }): Promise<{
   files: FileScanResult[];
   changedFiles: number;
+  retainedFiles: number;
   sources: string[];
   daily: DailyProviderBuckets;
 }> {
   const nowMs = options?.nowMs ?? Date.now();
   const cutoff = nowMs - NINETY_DAYS_MS;
+  const cutoffDay = dayKey(cutoff);
+  const home = options?.home ?? homedir();
   const cached = options?.cached ?? new Map();
+  const retained = options?.retained ?? cached;
+  const maxFileBytes = options?.maxFileBytes ?? MAX_FILE_BYTES;
   const files: FileScanResult[] = [];
   const sources: string[] = [];
+  const seen = new Set<string>();
   let changedFiles = 0;
   const daily: DailyProviderBuckets = {};
   const claudeEvents = new Map<string, TokenEvent>();
 
-  for (const source of tokenRoots()) {
+  const addDay = (day: string, provider: string, bucket: TokenBucket) => {
+    const row = daily[day] ?? {};
+    const current = row[provider] ?? emptyBucket();
+    addBucket(current, bucket);
+    row[provider] = current;
+    daily[day] = row;
+  };
+
+  const keepClaudeEvent = (messageId: string, event: TokenEvent) => {
+    const prior = claudeEvents.get(messageId);
+    if (
+      !prior ||
+      event.bucket.tokens > prior.bucket.tokens ||
+      (event.bucket.tokens === prior.bucket.tokens && event.atMs >= prior.atMs)
+    ) {
+      claudeEvents.set(messageId, event);
+    }
+  };
+
+  for (const source of tokenRoots(home)) {
     let listing: string[];
     try {
       listing = await walkJsonl(source.root);
@@ -422,25 +484,30 @@ export async function scanTokenFiles(options?: {
       } catch {
         continue;
       }
-      if (!info.isFile() || info.size === 0 || info.size > MAX_FILE_BYTES) {
-        continue;
-      }
+      if (!info.isFile() || info.size === 0) continue;
       if (info.mtimeMs < cutoff) continue;
 
-      const prior = cached.get(path);
+      const prior = cached.get(path) ?? retained.get(path);
       const stale =
         !prior ||
         prior.mtimeMs !== Math.round(info.mtimeMs) ||
         prior.size !== info.size;
-      const parsed = stale
-        ? await parseFile(path, source.id)
-        : { daily: prior.daily, keyedEvents: prior.keyedEvents };
-      if (stale) changedFiles += 1;
+      // An outsized file keeps its last parsed totals rather than falling out
+      // of the chart, which is what made history shrink as sessions grew.
+      const oversized = info.size > maxFileBytes;
+      if (oversized && !prior) continue;
+      const parsed =
+        stale && !oversized
+          ? await parseFile(path, source.id)
+          : { daily: prior!.daily, keyedEvents: prior!.keyedEvents };
+      if (stale && !oversized) changedFiles += 1;
 
+      seen.add(path);
       files.push({
         path,
-        mtimeMs: Math.round(info.mtimeMs),
-        size: info.size,
+        mtimeMs: oversized ? (prior!.mtimeMs ?? 0) : Math.round(info.mtimeMs),
+        size: oversized ? prior!.size : info.size,
+        provider: source.id,
         daily: parsed.daily,
         ...(parsed.keyedEvents ? { keyedEvents: parsed.keyedEvents } : {}),
       });
@@ -448,36 +515,13 @@ export async function scanTokenFiles(options?: {
       for (const [day, bucket] of Object.entries(parsed.daily) as Array<
         [string, TokenBucket]
       >) {
-        const row = daily[day] ?? {};
-        const current = row[source.id] ?? emptyBucket();
-        addBucket(current, bucket);
-        row[source.id] = current;
-        daily[day] = row;
+        addDay(day, source.id, bucket);
       }
 
       for (const [messageId, event] of Object.entries(
         parsed.keyedEvents ?? {},
       ) as Array<[string, TokenEvent]>) {
-        const priorEvent = claudeEvents.get(messageId);
-        if (
-          !priorEvent ||
-          event.bucket.tokens > priorEvent.bucket.tokens ||
-          (event.bucket.tokens === priorEvent.bucket.tokens &&
-            event.atMs >= priorEvent.atMs)
-        ) {
-          claudeEvents.set(messageId, event);
-        }
-      }
-    }
-
-    if (source.id === "claude-code") {
-      for (const event of claudeEvents.values()) {
-        const day = dayKey(event.atMs);
-        const row = daily[day] ?? {};
-        const current = row[source.id] ?? emptyBucket();
-        addBucket(current, event.bucket);
-        row[source.id] = current;
-        daily[day] = row;
+        keepClaudeEvent(messageId, event);
       }
     }
   }
@@ -495,7 +539,8 @@ export async function scanTokenFiles(options?: {
       ) {
         changedFiles += 1;
       }
-      files.push(file);
+      seen.add(file.path);
+      files.push({ ...file, provider: "cursor" });
     }
     mergeCursorDaily(daily, cursorFiles);
   }
@@ -509,10 +554,66 @@ export async function scanTokenFiles(options?: {
       if (!prior || prior.mtimeMs !== file.mtimeMs || prior.size !== file.size) {
         changedFiles += 1;
       }
-      files.push(file);
+      seen.add(file.path);
+      files.push({ ...file, provider: "opencode" });
     }
     mergeOpencodeDaily(daily, opencodeFiles);
   }
 
-  return { files, changedFiles, sources, daily };
+  /**
+   * Transcripts are evidence, not the ledger. Codex prunes old rollouts, bb
+   * removes a worktree's thread files, a session gets cleared — and until now
+   * every one of those silently erased days that had already been counted, so
+   * the 30-day total only ever fell. Replay the last parse of anything that has
+   * since left disk, bounded by the same 90-day window as a live file.
+   */
+  const retainedPaths: string[] = [];
+  for (const [path, entry] of retained) {
+    if (seen.has(path)) continue;
+    // A store this pass deliberately skipped is not gone; seedDailyFromCache
+    // paints those, and folding them here as well would double count.
+    if (options?.includeCursor === false && isCursorStorePath(path)) continue;
+    if (options?.includeOpencode === false && isOpencodeStorePath(path)) continue;
+    try {
+      const info = await stat(path);
+      if (info.isFile()) continue;
+    } catch {
+      // Genuinely gone.
+    }
+    const provider = entry.provider ?? providerForPath(path, home);
+    if (!provider) continue;
+    let kept = false;
+    for (const [day, bucket] of Object.entries(entry.daily ?? {}) as Array<
+      [string, TokenBucket]
+    >) {
+      if (day < cutoffDay) continue;
+      addDay(day, provider, bucket);
+      kept = true;
+    }
+    for (const [messageId, event] of Object.entries(
+      entry.keyedEvents ?? {},
+    ) as Array<[string, TokenEvent]>) {
+      if (event.atMs < cutoff) continue;
+      keepClaudeEvent(messageId, event);
+      kept = true;
+    }
+    if (!kept) continue;
+    retainedPaths.push(path);
+    if (!sources.includes(provider)) sources.push(provider);
+  }
+
+  // Claude reports the same response in every fragment that replays it, so the
+  // per-message winner is only known once every file — live and retained — has
+  // been folded in.
+  for (const event of claudeEvents.values()) {
+    addDay(dayKey(event.atMs), "claude-code", event.bucket);
+  }
+
+  return {
+    files,
+    changedFiles,
+    retainedFiles: retainedPaths.length,
+    sources,
+    daily,
+  };
 }

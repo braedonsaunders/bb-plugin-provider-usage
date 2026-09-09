@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -24,6 +25,7 @@ import {
 import {
   TOKEN_WINDOWS,
   assembleTokenSnapshot,
+  dayKey,
   formatTokenText,
   type TokenBucket,
   type TokenSnapshot,
@@ -41,6 +43,7 @@ import {
 import { createLocalThroughputScanner } from "./lib/local-throughput-scan";
 import { createOpencodeLiveThroughputSource } from "./lib/opencode-scan";
 import { createCursorLiveThroughputSource } from "./lib/cursor-scan";
+import { readAccountPool } from "./lib/account-pool";
 import { readCodexUsageSupplement } from "./lib/codex-usage";
 import {
   hasRateLimitedProvider,
@@ -104,6 +107,19 @@ const providerUsageSchema = z.object({
       description: z.string().nullable(),
     })
     .nullable(),
+  pooled: z.boolean(),
+  accounts: z.array(
+    z.object({
+      id: z.string(),
+      label: z.string(),
+      email: z.string().nullable(),
+      priority: z.number(),
+      status: z.string(),
+      unavailable: z.boolean(),
+      windows: z.array(usageWindowSchema),
+      message: z.string().nullable(),
+    }),
+  ),
 });
 
 const dashboardSchema = z.object({
@@ -158,6 +174,7 @@ const tokenSnapshotSchema = z.object({
   scannedAt: z.string(),
   fileCount: z.number().int(),
   changedFiles: z.number().int(),
+  retainedFiles: z.number().int(),
   sources: z.array(z.string()),
   totals: tokenBucketSchema,
   providers: z.array(
@@ -348,14 +365,19 @@ async function loadDashboard(
     bb.sdk.providers.list(resolvedHostId ? { hostId: resolvedHostId } : {}),
   ]);
 
-  const codexSupplement =
+  // Both reads describe processes on the machine bb runs on, so neither is
+  // meaningful once the user is inspecting a remote host's meters.
+  const [codexSupplement, pool] = await Promise.all([
     resolvedHostId === null && slices.codex.status === "ok"
-      ? await readCodexUsageSupplement()
-      : null;
+      ? readCodexUsageSupplement()
+      : Promise.resolve(null),
+    resolvedHostId === null ? readAccountPool() : Promise.resolve({}),
+  ]);
 
   return assembleDashboard({
     limits: slices,
     supplements: codexSupplement ? { codex: codexSupplement } : undefined,
+    pool,
     hosts,
     catalog,
     hostId: resolvedHostId,
@@ -410,6 +432,7 @@ type TokenCacheRow = {
 
 type PersistedTokenFile = {
   version: 2;
+  provider?: string;
   daily: Record<string, TokenBucket>;
   keyedEvents?: FileScanResult["keyedEvents"];
   blobCount?: number;
@@ -464,6 +487,7 @@ function createTokenStore(bb: BbPluginApi) {
       loadCache.set(row.path, {
         mtimeMs: row.mtime_ms,
         size: row.size,
+        ...(persisted.provider ? { provider: persisted.provider } : {}),
         daily: persisted.daily,
         ...(persisted.keyedEvents
           ? { keyedEvents: persisted.keyedEvents }
@@ -507,6 +531,7 @@ function createTokenStore(bb: BbPluginApi) {
           file.size,
           JSON.stringify({
             version: 2,
+            ...(file.provider ? { provider: file.provider } : {}),
             daily: file.daily,
             ...(file.keyedEvents ? { keyedEvents: file.keyedEvents } : {}),
             ...(file.blobCount != null
@@ -517,6 +542,7 @@ function createTokenStore(bb: BbPluginApi) {
         loadCache.set(file.path, {
           mtimeMs: file.mtimeMs,
           size: file.size,
+          ...(file.provider ? { provider: file.provider } : {}),
           daily: file.daily,
           ...(file.keyedEvents ? { keyedEvents: file.keyedEvents } : {}),
           ...(file.blobCount != null
@@ -533,6 +559,7 @@ function createTokenStore(bb: BbPluginApi) {
     scanned: {
       files: FileScanResult[];
       changedFiles: number;
+      retainedFiles?: number;
       sources: string[];
       daily: Record<string, Record<string, TokenBucket>>;
     },
@@ -541,12 +568,47 @@ function createTokenStore(bb: BbPluginApi) {
       days,
       fileCount: scanned.files.length,
       changedFiles: scanned.changedFiles,
+      retainedFiles: scanned.retainedFiles,
       sources: scanned.sources,
       daily: scanned.daily,
     });
     lastSnapshot = snapshot;
     writeMeta.run("last-scan", snapshot.scannedAt);
     return snapshot;
+  };
+
+  const deleteRow = db.prepare("DELETE FROM token_file_cache WHERE path = ?");
+
+  /**
+   * Retained rows are only worth keeping while their days are still inside the
+   * reporting window. Once a deleted file's newest day ages out, drop it so the
+   * ledger does not grow without bound.
+   */
+  const pruneLedger = (nowMs: number) => {
+    const cutoffDay = dayKey(nowMs - 90 * 24 * 60 * 60 * 1000);
+    const dead: string[] = [];
+    for (const [path, entry] of loadCache) {
+      if (existsSync(path)) continue;
+      let newest = "";
+      for (const day of Object.keys(entry.daily ?? {})) {
+        if (day > newest) newest = day;
+      }
+      for (const event of Object.values(entry.keyedEvents ?? {})) {
+        const day = dayKey(event.atMs);
+        if (day > newest) newest = day;
+      }
+      if (newest >= cutoffDay) continue;
+      dead.push(path);
+    }
+    if (dead.length === 0) return;
+    const tx = db.transaction((paths: string[]) => {
+      for (const path of paths) {
+        deleteRow.run(path);
+        loadCache.delete(path);
+      }
+    });
+    tx(dead);
+    bb.log.info(`token ledger pruned ${dead.length} aged-out deleted files`);
   };
 
   const hasCursorCache = () =>
@@ -615,6 +677,7 @@ function createTokenStore(bb: BbPluginApi) {
       // the heavier stores refresh.
       const jsonl = await scanTokenFiles({
         cached,
+        retained: loadCache,
         includeCursor: false,
         includeOpencode: false,
       });
@@ -629,6 +692,7 @@ function createTokenStore(bb: BbPluginApi) {
       const phase2Started = Date.now();
       const full = await scanTokenFiles({
         cached: loadCache,
+        retained: loadCache,
         includeCursor: true,
         includeOpencode: true,
       });
@@ -639,9 +703,11 @@ function createTokenStore(bb: BbPluginApi) {
       bb.log.info(
         `token scan phase2 ${Date.now() - phase2Started}ms ` +
           `changed=${full.changedFiles} ` +
+          `retained=${full.retainedFiles} ` +
           `bbThreads=${bbUsage.threadsScanned} ` +
           `providers [${bbUsage.providers.join(", ") || "none"}]`,
       );
+      pruneLedger(nowMs);
       const snapshot = snapshotFrom(days, full);
       publish();
       return snapshot;
@@ -657,6 +723,7 @@ function createTokenStore(bb: BbPluginApi) {
       if (lastSnapshot.days !== days) {
         const scanned = await scanTokenFiles({
           cached: loadCache,
+          retained: loadCache,
           includeCursor: hasCursorCache(),
           includeOpencode: hasOpencodeCache(),
         });
@@ -665,6 +732,7 @@ function createTokenStore(bb: BbPluginApi) {
           days,
           fileCount: scanned.files.length,
           changedFiles: scanned.changedFiles,
+          retainedFiles: scanned.retainedFiles,
           sources: scanned.sources,
           daily: scanned.daily,
         });
@@ -681,6 +749,7 @@ function createTokenStore(bb: BbPluginApi) {
     }
     const jsonl = await scanTokenFiles({
       cached: loadCache,
+      retained: loadCache,
       includeCursor: false,
       includeOpencode: false,
     });

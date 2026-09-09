@@ -81,6 +81,13 @@ export interface ProviderUsage {
   credits: ProviderCreditBalance | null;
   spendControl: ProviderSpendControl | null;
   resetCredits: ProviderResetCredits | null;
+  /** True when the Account Pooler is routing this provider across a pool. */
+  pooled: boolean;
+  /**
+   * Enabled pool accounts in failover order. Empty when this provider is not
+   * pooled, so the single-account dashboard is unchanged for everyone else.
+   */
+  accounts: ProviderAccountUsage[];
 }
 
 export interface ProviderCreditBalance {
@@ -102,6 +109,26 @@ export interface ProviderResetCredits {
   nextExpiresAt: string | null;
   title: string | null;
   description: string | null;
+}
+
+/**
+ * One account inside a provider's pool. The Account Pooler routes a provider's
+ * traffic across several logins, so a single meter per provider stops
+ * describing what the next request will actually get: the account at the front
+ * of the failover order can be exhausted while the pool as a whole is fine.
+ */
+export interface ProviderAccountUsage {
+  id: string;
+  label: string;
+  email: string | null;
+  /** Position in the failover order, lowest first; ties keep pool order. */
+  priority: number;
+  /** `ready`, `exhausted`, `error`, or whatever the pool reports next. */
+  status: string;
+  /** True once the pool has skipped this account for new requests. */
+  unavailable: boolean;
+  windows: UsageWindow[];
+  message: string | null;
 }
 
 export interface UsageHost {
@@ -165,6 +192,27 @@ export interface ProviderCatalogEntry {
   id: string;
   displayName: string;
   logoUrl: string | null;
+}
+
+/**
+ * Name a limit window from its length. Codex reports window duration and the
+ * Account Pooler reports the same idea in minutes, so both render the phrase
+ * the provider's own UI uses rather than "primary"/"secondary".
+ */
+export function formatWindowDurationLabel(
+  minutes: number | null,
+  fallback: string,
+): string {
+  if (minutes === null || minutes <= 0) return fallback;
+  if (minutes === 60) return "Hourly limit";
+  if (minutes < 24 * 60 && minutes % 60 === 0) return `${minutes / 60}-hour limit`;
+  if (minutes === 24 * 60) return "Daily limit";
+  if (minutes === 7 * 24 * 60) return "Weekly limit";
+  if (minutes % (7 * 24 * 60) === 0) {
+    return `${minutes / (7 * 24 * 60)}-week limit`;
+  }
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}-day limit`;
+  return fallback;
 }
 
 export function clampPercent(value: number): number {
@@ -393,6 +441,7 @@ function buildTotals(providers: ProviderUsage[]): UsageTotals {
 export function assembleDashboard(input: {
   limits: Record<ProviderKey, ProviderLimitSlice>;
   supplements?: Partial<Record<ProviderKey, ProviderSupplement>>;
+  pool?: Partial<Record<ProviderKey, ProviderAccountUsage[]>>;
   hosts: UsageHost[];
   catalog: readonly ProviderCatalogEntry[];
   hostId: string | null;
@@ -409,12 +458,16 @@ export function assembleDashboard(input: {
   const trackedKeys = PROVIDER_KEYS.filter((key) => {
     const slice = input.limits[key];
     if (slice === undefined) return false;
+    // A pooled provider is one the user is actively routing, so it stays on the
+    // dashboard even if the host reports nothing for the local login.
+    if ((input.pool?.[key]?.length ?? 0) > 0) return true;
     return slice.status !== "not_installed" || isRegistered(key, input.catalog);
   });
 
   const providers = trackedKeys.map((key) => {
     const slice = input.limits[key]!;
     const supplement = input.supplements?.[key];
+    const accounts = input.pool?.[key] ?? [];
     const identity = resolveCatalog(key, input.catalog);
     return {
       key,
@@ -434,6 +487,8 @@ export function assembleDashboard(input: {
         slice.status === "ok" ? (supplement?.spendControl ?? null) : null,
       resetCredits:
         slice.status === "ok" ? (supplement?.resetCredits ?? null) : null,
+      pooled: accounts.length > 0,
+      accounts,
     } satisfies ProviderUsage;
   });
 
@@ -487,7 +542,29 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
     const bits = [provider.displayName];
     if (provider.planLabel) bits.push(provider.planLabel);
     if (provider.accountEmail) bits.push(provider.accountEmail);
+    if (provider.pooled) {
+      bits.push(`pooled · ${provider.accounts.length} accounts`);
+    }
     lines.push(bits.join(" · "));
+    // Pooled accounts print before the status check: with routing on, the
+    // host's view of the local login can be unauthenticated while the pool is
+    // serving requests perfectly well from another account.
+    for (const account of provider.accounts) {
+      const state = account.unavailable ? ` · ${account.status}` : "";
+      lines.push(`  ${account.label}${state}`);
+      if (account.message) lines.push(`    ${account.message}`);
+      for (const window of account.windows) {
+        const reset = window.resetsAt
+          ? ` · resets ${formatResetAbsolute(window.resetsAt)} (in ${formatResetRelative(window.resetsAt)})`
+          : "";
+        lines.push(
+          `    ${window.label.padEnd(16)} ${formatPercent(window.remainingPercent)} left · ${formatPercent(window.usedPercent)} used${reset}`,
+        );
+      }
+      if (account.windows.length === 0) {
+        lines.push("    No limit windows reported");
+      }
+    }
     if (provider.status !== "ok") {
       lines.push(`  ${statusLabel(provider.status)}${provider.message ? ` — ${provider.message}` : ""}`);
       continue;

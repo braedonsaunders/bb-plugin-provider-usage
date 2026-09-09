@@ -39,6 +39,8 @@ export interface TokenSnapshot {
   scannedAt: string;
   fileCount: number;
   changedFiles: number;
+  /** Files counted from the persisted ledger because they left disk. */
+  retainedFiles: number;
   sources: string[];
   totals: TokenBucket;
   providers: TokenProviderRow[];
@@ -144,6 +146,7 @@ export function assembleTokenSnapshot(input: {
   days: TokenWindowDays;
   fileCount: number;
   changedFiles: number;
+  retainedFiles?: number;
   sources: string[];
   scannedAt?: string;
   daily: Record<string, Record<string, TokenBucket>>;
@@ -185,6 +188,7 @@ export function assembleTokenSnapshot(input: {
     scannedAt: input.scannedAt ?? new Date().toISOString(),
     fileCount: input.fileCount,
     changedFiles: input.changedFiles,
+    retainedFiles: input.retainedFiles ?? 0,
     sources: input.sources,
     totals,
     providers,
@@ -199,7 +203,11 @@ export function formatTokenText(snapshot: TokenSnapshot): string {
     `  Input             ${formatTokenCount(snapshot.totals.input)}`,
     `  Output            ${formatTokenCount(snapshot.totals.output)}`,
     `  Cached            ${formatTokenCount(snapshot.totals.cached)}`,
-    `  Files scanned     ${snapshot.fileCount}`,
+    `  Files scanned     ${snapshot.fileCount}${
+      snapshot.retainedFiles > 0
+        ? ` (+${snapshot.retainedFiles} retained after deletion)`
+        : ""
+    }`,
     "",
     "By provider",
   ];

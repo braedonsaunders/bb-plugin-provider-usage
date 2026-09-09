@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { formatWindowDurationLabel } from "./dashboard";
 import type { ProviderSupplement } from "./dashboard";
 
 type JsonRecord = Record<string, unknown>;
@@ -38,23 +39,6 @@ function isoFromUnixSeconds(value: unknown): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
-function durationLabel(minutes: number | null, fallback: string): string {
-  if (minutes === null || minutes <= 0) return fallback;
-  if (minutes === 60) return "Hourly limit";
-  if (minutes < 24 * 60 && minutes % 60 === 0) {
-    return `${minutes / 60}-hour limit`;
-  }
-  if (minutes === 24 * 60) return "Daily limit";
-  if (minutes === 7 * 24 * 60) return "Weekly limit";
-  if (minutes % (7 * 24 * 60) === 0) {
-    return `${minutes / (7 * 24 * 60)}-week limit`;
-  }
-  if (minutes % (24 * 60) === 0) {
-    return `${minutes / (24 * 60)}-day limit`;
-  }
-  return fallback;
-}
-
 function normalizeWindow(
   snapshot: JsonRecord,
   key: "primary" | "secondary",
@@ -65,7 +49,7 @@ function normalizeWindow(
   if (usedPercent === null) return null;
   const duration = finiteNumber(raw.windowDurationMins);
   const generic = key === "primary" ? "Primary limit" : "Secondary limit";
-  const baseLabel = durationLabel(duration, generic);
+  const baseLabel = formatWindowDurationLabel(duration, generic);
   const limitName = scalarString(snapshot.limitName);
   return {
     label: limitName ? `${limitName} · ${baseLabel}` : baseLabel,

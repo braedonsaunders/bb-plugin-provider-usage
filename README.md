@@ -31,6 +31,26 @@ On the primary machine, Codex adds purchased-credit balance, banked reset count
 and expiry, model-specific limit buckets, and any on-demand spend control the
 Codex backend reports.
 
+**Pooled accounts.** When the Account Pooler routes a provider across several
+logins, one meter per provider stops describing what the next request will get:
+the account at the front of the failover order can be exhausted while the pool
+as a whole is fine. Such a provider expands into one meter per enabled account,
+in failover order, and the provider's ring follows the account that is actually
+serving new requests rather than whichever login the CLI happens to hold. A
+pooled provider stays on the dashboard even when the host reports nothing for
+its local credentials, which is the normal state once routing is on.
+
+Accounts are read from `bb pool status --json` on the machine bb runs on, so
+nothing here touches the pool's stored tokens. Providers are matched by the
+pooler's own names (`codex`, `claude`), and a provider whose routing switch is
+off is left alone — bb still hands it its own credentials, so the pool's numbers
+would describe traffic that is not flowing there. The pooler is experimental and
+says its CLI can change between releases; every field is parsed defensively, and
+a pool that cannot be read leaves the dashboard exactly as it was.
+
+The totals row still aggregates each provider's host-reported windows, so
+"tightest" and "next reset" do not yet account for pooled accounts.
+
 **Token usage, for every provider.** A 7 / 30 / 90-day multi-series chart of
 real token volume, broken out into total, uncached input, output, and cached,
 per provider. Total follows the provider's canonical count where one is
@@ -108,6 +128,14 @@ Token totals come from a background `token-scan` service that walks local
 transcript files, caches per-file results in the plugin's SQLite database, and
 re-syncs every 15 minutes. Only sources whose size or mtime changed are re-read,
 so a large history stays cheap. Nothing is uploaded anywhere.
+
+That per-file cache is also the ledger. Transcripts are evidence of usage, not
+the record of it: Codex prunes old rollouts, BB removes a worktree's thread
+files, a session gets cleared. A file that leaves disk keeps the days it already
+contributed until those days age out of the 90-day window, so the chart never
+revises history downwards for work that really happened. Claude responses are
+still deduplicated by message id across live and retained files, so a fragment
+that replays a response cannot count it twice.
 
 The same pass asks BB for `thread/tokenUsage/updated` on any thread whose
 provider has no dedicated scanner. Those events carry the thread's *running*

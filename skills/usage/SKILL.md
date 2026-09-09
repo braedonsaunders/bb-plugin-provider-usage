@@ -26,6 +26,14 @@ availability/expiry, and any backend-reported on-demand period. A window's
 `tokens.totals` and `tokens.providers` for global Codex/Claude transcript token
 volume across Codex, Claude Code, Cursor, and opencode.
 
+When a provider row has `pooled: true`, the Account Pooler is routing it across
+the logins in `accounts[]`, listed in failover order. Judge whether to wait for
+a reset from the first account with `unavailable: false` — that is the one that
+will serve the next request. The row's own `windows[]` describe only the local
+credentials, which are routinely exhausted or unauthenticated while the pool
+keeps working, so do not report a pooled provider as out of quota unless every
+entry in `accounts[]` is unavailable.
+
 `bb usage live` answers "what is being burned right now": `tokensPerMinute` is
 the trailing-60-second rate, `peakTokensPerMinute` the best rate in the last 15
 minutes, and `threads[]` attributes it to the threads doing the work. Archived
