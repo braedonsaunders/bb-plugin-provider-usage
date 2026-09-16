@@ -567,9 +567,13 @@ function PoolAccountRow({
   // Provider-wide extras (credits, banked resets, on-demand spend) are read
   // from the local login, so they belong to that account rather than floating
   // underneath the pool as though they covered every account in it.
-  const showsProviderDetail =
-    account.local &&
-    Boolean(provider.credits ?? provider.resetCredits ?? provider.spendControl);
+  const hasProviderDetail = Boolean(
+    provider.credits ?? provider.resetCredits ?? provider.spendControl,
+  );
+  const showsProviderDetail = account.local && hasProviderDetail;
+  // Only worth saying when the signed-in account is showing extras this one
+  // cannot; otherwise it is a note about nothing.
+  const explainsMissingDetail = !account.local && hasProviderDetail;
 
   return (
     <div className="first:rounded-t-lg last:rounded-b-lg [&:not(:last-child)]:border-b border-border/60">
@@ -646,6 +650,13 @@ function PoolAccountRow({
             </p>
           )}
           {showsProviderDetail ? <ProviderDetails provider={provider} /> : null}
+          {explainsMissingDetail ? (
+            <p className="text-xs text-muted-foreground">
+              Credit balance and banked resets come from the provider CLI, which
+              only reports on the account this machine is signed into. The pool
+              does not publish them per account.
+            </p>
+          ) : null}
         </div>
       ) : null}
     </div>

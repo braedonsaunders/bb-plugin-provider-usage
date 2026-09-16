@@ -15,10 +15,18 @@ import {
  * usage slightly after its last row touch is still picked up.
  */
 const POLL_GRACE_MS = 5 * 60_000;
-/** Events pulled when a thread is first seen, newest-first. */
+/**
+ * BB rejects any thread-event page larger than this with a 400, so every read
+ * here pages rather than asking for its whole budget at once. Asking for more
+ * is not merely trimmed — the request fails outright, which is silent to the
+ * chart: the scanner catches, skips the thread, never stores a cursor, and
+ * draws a confident flat zero. Keep every `limit` that reaches BB clamped here.
+ */
+const MAX_EVENT_PAGE = 100;
+/** Ceiling on the first-sight backfill, in events across all pages. */
 const BASELINE_LIMIT = 300;
-/** Events pulled per poll once a thread has a cursor. */
-const INCREMENT_LIMIT = 200;
+/** Ceiling on how far one poll will chase a thread that ran ahead of us. */
+const INCREMENT_LIMIT = 500;
 
 export interface ThroughputScanThread {
   id: string;
@@ -43,6 +51,7 @@ export interface ThroughputScanDeps {
   listEvents: (args: {
     threadId: string;
     afterSeq?: number;
+    beforeSeq?: number;
     order: "asc" | "desc";
     limit: number;
   }) => Promise<BbUsageEvent[]>;
@@ -100,6 +109,77 @@ export function createThroughputScanner(
       return bucketFromTotals(event.total, {});
     }
     return null;
+  };
+
+  /**
+   * The newest events for a thread we have never read, walked backwards a page
+   * at a time. It stops as soon as a page reaches past the window, because the
+   * only thing older history buys is the one row that becomes the baseline —
+   * everything before that is outside the chart and would be discarded anyway.
+   * In the common case that is a single request; a thread that has been busy
+   * for the whole window costs at most `BASELINE_LIMIT / MAX_EVENT_PAGE` of
+   * them.
+   */
+  const readBaseline = async (
+    threadId: string,
+    nowMs: number,
+  ): Promise<BbUsageEvent[]> => {
+    const collected: BbUsageEvent[] = [];
+    let beforeSeq: number | undefined;
+    while (collected.length < BASELINE_LIMIT) {
+      const limit = Math.min(MAX_EVENT_PAGE, BASELINE_LIMIT - collected.length);
+      const page = await deps.listEvents({
+        threadId,
+        order: "desc",
+        limit,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      });
+      if (page.length === 0) break;
+      collected.push(...page);
+      if (page.some((event) => event.createdAt <= nowMs - windowMs)) break;
+      // A short page is the start of the thread; there is nothing behind it.
+      if (page.length < limit) break;
+      const lowest = page.reduce(
+        (min, event) => Math.min(min, event.seq),
+        Number.POSITIVE_INFINITY,
+      );
+      if (!Number.isFinite(lowest) || lowest <= 1) break;
+      beforeSeq = lowest;
+    }
+    return collected;
+  };
+
+  /**
+   * Everything past the cursor, paged forward. Without the loop a thread that
+   * reported more than one page between polls would never be caught: each poll
+   * would read a page, advance by a page, and stay exactly as far behind.
+   */
+  const readIncrement = async (
+    threadId: string,
+    afterSeq: number,
+  ): Promise<BbUsageEvent[]> => {
+    const collected: BbUsageEvent[] = [];
+    let cursorSeq = afterSeq;
+    while (collected.length < INCREMENT_LIMIT) {
+      const limit = Math.min(MAX_EVENT_PAGE, INCREMENT_LIMIT - collected.length);
+      const page = await deps.listEvents({
+        threadId,
+        afterSeq: cursorSeq,
+        order: "asc",
+        limit,
+      });
+      if (page.length === 0) break;
+      collected.push(...page);
+      const highest = page.reduce(
+        (max, event) => Math.max(max, event.seq),
+        cursorSeq,
+      );
+      // Defensive: a page that does not move the cursor would spin forever.
+      if (highest <= cursorSeq) break;
+      cursorSeq = highest;
+      if (page.length < limit) break;
+    }
+    return collected;
   };
 
   const ingest = (
@@ -176,16 +256,9 @@ export function createThroughputScanner(
         const cursor = cursors.get(thread.id);
         let events: BbUsageEvent[];
         try {
-          events = await deps.listEvents(
-            cursor
-              ? {
-                  threadId: thread.id,
-                  afterSeq: cursor.lastSeq,
-                  order: "asc",
-                  limit: INCREMENT_LIMIT,
-                }
-              : { threadId: thread.id, order: "desc", limit: BASELINE_LIMIT },
-          );
+          events = cursor
+            ? await readIncrement(thread.id, cursor.lastSeq)
+            : await readBaseline(thread.id, nowMs);
         } catch (error) {
           deps.onError?.(error);
           continue;

@@ -182,9 +182,19 @@ function scannerHarness(events, thread = {}) {
     ],
     listEvents: async (args) => {
       calls.push(args);
-      const rows = args.afterSeq
-        ? events.filter((event) => event.seq > args.afterSeq)
-        : events;
+      // BB itself 400s above 100; a harness that quietly served more would let
+      // the bug that flat-lined the chart back in.
+      assert.ok(
+        args.limit <= 100,
+        `asked BB for ${args.limit} events, over the 100 cap`,
+      );
+      let rows = events;
+      if (args.afterSeq !== undefined) {
+        rows = rows.filter((event) => event.seq > args.afterSeq);
+      }
+      if (args.beforeSeq !== undefined) {
+        rows = rows.filter((event) => event.seq < args.beforeSeq);
+      }
       const ordered =
         args.order === "desc" ? [...rows].reverse() : [...rows];
       return ordered.slice(0, args.limit);
@@ -308,7 +318,7 @@ test("a truncated first read still only baselines its oldest row", async () => {
       },
     });
   }
-  const { recorder, scanner } = scannerHarness(events);
+  const { recorder, scanner, calls } = scannerHarness(events);
 
   await scanner.refresh(NOW);
   const snapshot = recorder.snapshot(NOW);
@@ -317,6 +327,74 @@ test("a truncated first read still only baselines its oldest row", async () => {
   // 299 differences are 1,000 each. Charting that first row instead would have
   // dropped its whole 21,000,000-token running total onto one instant.
   assert.equal(snapshot.windowTotals.tokens, 299_000);
+  // Those 300 rows arrive as three capped pages walking backwards, not as one
+  // oversized request.
+  assert.equal(calls.length, 3);
+  assert.deepEqual(
+    calls.map((call) => call.beforeSeq),
+    [undefined, 221, 121],
+  );
+});
+
+test("the baseline stops at the first page that reaches past the window", async () => {
+  // Every event is 20s apart, so the newest hundred already span well over the
+  // 15-minute window. Reading further back could only add rows the chart drops.
+  const events = [];
+  for (let index = 1; index <= 150; index += 1) {
+    events.push({
+      seq: index,
+      createdAt: NOW - (150 - index) * 20_000,
+      total: {
+        totalTokens: index * 1_000,
+        inputTokens: index * 1_000,
+        outputTokens: 0,
+      },
+    });
+  }
+  const { scanner, calls } = scannerHarness(events);
+
+  await scanner.refresh(NOW);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].limit, 100);
+});
+
+test("a poll pages forward past a thread that ran ahead of the cursor", async () => {
+  const events = [
+    {
+      seq: 1,
+      createdAt: NOW - 60_000,
+      total: { totalTokens: 1_000, inputTokens: 1_000, outputTokens: 0 },
+    },
+  ];
+  const { recorder, scanner, calls } = scannerHarness(events);
+
+  await scanner.refresh(NOW);
+  const baselineCalls = calls.length;
+
+  // 250 turns land between polls — more than one page, which a single capped
+  // request would never catch up on: it would advance a page and stay exactly
+  // as far behind on every poll after it.
+  for (let index = 2; index <= 251; index += 1) {
+    events.push({
+      seq: index,
+      createdAt: NOW - 30_000 + index * 10,
+      total: {
+        totalTokens: index * 1_000,
+        inputTokens: index * 1_000,
+        outputTokens: 0,
+      },
+    });
+  }
+  await scanner.refresh(NOW);
+
+  const forward = calls.slice(baselineCalls);
+  assert.deepEqual(
+    forward.map((call) => call.afterSeq),
+    [1, 101, 201],
+  );
+  // Baselined at 1,000, now at 251,000: every one of the 250 steps is charted.
+  assert.equal(recorder.snapshot(NOW).windowTotals.tokens, 250_000);
 });
 
 test("threads that disappear stop being tracked", async () => {

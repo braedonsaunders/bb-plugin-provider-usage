@@ -800,13 +800,14 @@ function createThroughputStore(bb: BbPluginApi) {
         `throughput scan: ${error instanceof Error ? error.message : String(error)}`,
       ),
     listThreads,
-    listEvents: async ({ threadId, afterSeq, order, limit }) => {
+    listEvents: async ({ threadId, afterSeq, beforeSeq, order, limit }) => {
       const rows = await bb.sdk.threads.events.list({
         threadId,
         types: ["thread/tokenUsage/updated"],
         order,
         limit: String(limit),
         ...(afterSeq === undefined ? {} : { afterSeq: String(afterSeq) }),
+        ...(beforeSeq === undefined ? {} : { beforeSeq: String(beforeSeq) }),
       });
       const events: BbUsageEvent[] = [];
       for (const row of rows) {
