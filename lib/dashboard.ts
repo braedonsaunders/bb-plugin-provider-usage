@@ -655,7 +655,9 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
       const count = provider.resetCredits.availableCount;
       const expiry = provider.resetCredits.nextExpiresAt
         ? ` · next expires ${formatResetAbsolute(provider.resetCredits.nextExpiresAt)} (in ${formatResetRelative(provider.resetCredits.nextExpiresAt)})`
-        : "";
+        : provider.resetCredits.description
+          ? ` · ${provider.resetCredits.description}`
+          : "";
       lines.push(
         `  ${"Banked resets".padEnd(18)} ${count} available${expiry}`,
       );

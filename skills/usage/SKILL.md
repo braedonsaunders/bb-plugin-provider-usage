@@ -21,7 +21,9 @@ providers, `totals.tightest` for the most exhausted window, and each provider
 `windows[].remainingPercent` when deciding whether a thread should wait for a
 reset. Provider rows may also include `credits`, `resetCredits`, and
 `spendControl`; for Codex these expose purchased-credit balance, banked reset
-availability/expiry, and any backend-reported on-demand period. A window's
+availability/expiry, and any backend-reported on-demand period. Claude
+`resetCredits` is the same shape: saved grant count plus the unused weekly
+session reset when one is still sitting on the account. A window's
 `cost` gives exact used/limit dollars when the provider reports them. Use
 `tokens.totals` and `tokens.providers` for global Codex/Claude transcript token
 volume across Codex, Claude Code, Cursor, and opencode.

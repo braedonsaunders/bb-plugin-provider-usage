@@ -8,6 +8,7 @@ import {
   type DashboardSnapshot,
   type ProviderKey,
   type ProviderLimitSlice,
+  type ProviderSupplement,
   type UsageHost,
 } from "./lib/dashboard";
 import {
@@ -44,6 +45,7 @@ import { createLocalThroughputScanner } from "./lib/local-throughput-scan";
 import { createOpencodeLiveThroughputSource } from "./lib/opencode-scan";
 import { createCursorLiveThroughputSource } from "./lib/cursor-scan";
 import { readAccountPool } from "./lib/account-pool";
+import { readClaudeUsageSupplement } from "./lib/claude-usage";
 import { readCodexUsageSupplement } from "./lib/codex-usage";
 import {
   hasRateLimitedProvider,
@@ -271,6 +273,17 @@ type LastFetch = {
   hostId: string | null;
   limits: Record<ProviderKey, ProviderLimitSlice>;
   rateLimitedAt: number | null;
+  /**
+   * Claude extras (banked resets) are a second Anthropic call. Cache them
+   * with the windows so a UI refresh does not 429 the usage endpoint. `null`
+   * means we asked and there was nothing to show; omitted is a pre-0.11 cache.
+   */
+  claudeSupplement?: ProviderSupplement | null;
+};
+
+type LimitsSnapshot = {
+  limits: Record<ProviderKey, ProviderLimitSlice>;
+  claudeSupplement: ProviderSupplement | null;
 };
 
 function createLimitStore(bb: BbPluginApi) {
@@ -293,23 +306,36 @@ function createLimitStore(bb: BbPluginApi) {
 
   let lastGood = readJson<LastGoodLimits>("last-good") ?? {};
   let lastFetch = readJson<LastFetch>("last-fetch");
-  let inflight: Promise<Record<ProviderKey, ProviderLimitSlice>> | null = null;
+  let inflight: Promise<LimitsSnapshot> | null = null;
 
   const persist = () => {
     write.run("last-good", JSON.stringify(lastGood));
     if (lastFetch) write.run("last-fetch", JSON.stringify(lastFetch));
   };
 
-  const readLive = async (hostId: string | null) => {
-    const raw = await bb.sdk.system.usageLimits(hostId ? { hostId } : {});
+  const snapshotFrom = (
+    limits: Record<ProviderKey, ProviderLimitSlice>,
+    claudeSupplement: ProviderSupplement | null,
+  ): LimitsSnapshot => ({ limits, claudeSupplement });
+
+  const readLive = async (hostId: string | null): Promise<LimitsSnapshot> => {
+    const [raw, claude] = await Promise.all([
+      bb.sdk.system.usageLimits(hostId ? { hostId } : {}),
+      hostId === null
+        ? readClaudeUsageSupplement()
+        : Promise.resolve(null),
+    ]);
     const fresh = normalizeProviderLimits(raw);
     const limits = overlayLastGoodLimits(fresh, lastGood);
     lastGood = rememberGoodLimits(limits, lastGood);
+    // A 429 or timeout must not blank a reset we already showed.
+    const claudeSupplement = claude ?? lastFetch?.claudeSupplement ?? null;
     lastFetch = {
       at: Date.now(),
       hostId,
       limits,
       rateLimitedAt: hasRateLimitedProvider(fresh) ? Date.now() : null,
+      claudeSupplement,
     };
     persist();
     if (hasRateLimitedProvider(fresh)) {
@@ -317,13 +343,17 @@ function createLimitStore(bb: BbPluginApi) {
         "usage limits: a provider was rate-limited; serving last good windows",
       );
     }
-    return limits;
+    return snapshotFrom(limits, claudeSupplement);
   };
 
-  const get = async (hostId: string | null, force = false) => {
+  const get = async (
+    hostId: string | null,
+    force = false,
+  ): Promise<LimitsSnapshot> => {
     if (
       lastFetch &&
       lastFetch.hostId === hostId &&
+      lastFetch.claudeSupplement !== undefined &&
       shouldReuseCachedLimits({
         nowMs: Date.now(),
         fetchedAtMs: lastFetch.at,
@@ -331,7 +361,7 @@ function createLimitStore(bb: BbPluginApi) {
         force,
       })
     ) {
-      return lastFetch.limits;
+      return snapshotFrom(lastFetch.limits, lastFetch.claudeSupplement ?? null);
     }
     if (inflight && !force) return inflight;
     const run = readLive(hostId);
@@ -349,7 +379,9 @@ function createLimitStore(bb: BbPluginApi) {
 async function loadDashboard(
   bb: BbPluginApi,
   hostId: string | null,
-  limitsStore: { get: (hostId: string | null, force?: boolean) => Promise<Record<ProviderKey, ProviderLimitSlice>> },
+  limitsStore: {
+    get: (hostId: string | null, force?: boolean) => Promise<LimitsSnapshot>;
+  },
   force = false,
 ): Promise<DashboardSnapshot> {
   const hosts = (await bb.sdk.hosts.list()).map(
@@ -361,10 +393,11 @@ async function loadDashboard(
   );
   const resolvedHostId =
     hostId && hosts.some((host) => host.id === hostId) ? hostId : null;
-  const [slices, catalog] = await Promise.all([
+  const [snapshot, catalog] = await Promise.all([
     limitsStore.get(resolvedHostId, force),
     bb.sdk.providers.list(resolvedHostId ? { hostId: resolvedHostId } : {}),
   ]);
+  const slices = snapshot.limits;
 
   // Both reads describe processes on the machine bb runs on, so neither is
   // meaningful once the user is inspecting a remote host's meters.
@@ -374,10 +407,18 @@ async function loadDashboard(
       : Promise.resolve(null),
     resolvedHostId === null ? readAccountPool() : Promise.resolve({}),
   ]);
+  const claudeSupplement =
+    resolvedHostId === null && slices.claudeCode.status === "ok"
+      ? snapshot.claudeSupplement
+      : null;
+  const supplements = {
+    ...(codexSupplement ? { codex: codexSupplement } : {}),
+    ...(claudeSupplement ? { claudeCode: claudeSupplement } : {}),
+  };
 
   return assembleDashboard({
     limits: slices,
-    supplements: codexSupplement ? { codex: codexSupplement } : undefined,
+    supplements: Object.keys(supplements).length > 0 ? supplements : undefined,
     pool,
     hosts,
     catalog,

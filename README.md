@@ -29,7 +29,9 @@ plugin is installed.
 
 On the primary machine, Codex adds purchased-credit balance, banked reset count
 and expiry, model-specific limit buckets, and any on-demand spend control the
-Codex backend reports.
+Codex backend reports. Claude adds the same banked-reset row: saved grant
+resets plus the unused weekly session reset (1/week) when Anthropic reports
+them.
 
 **Pooled accounts.** When the Account Pooler routes a provider across several
 logins, one meter per provider stops describing what the next request will get:
@@ -128,10 +130,11 @@ long-running thread can decide whether to keep going or wait for a reset.
 
 Subscription windows come from BB's own `system.usageLimits` for each signed-in
 provider. On the primary machine, a read-only `codex app-server` request fills
-in newer Codex fields that BB's provider-neutral schema does not yet carry. It
-uses the existing Codex sign-in and never reads, stores, or returns auth tokens.
-If the installed Codex version does not support the request, the panel silently
-falls back to BB's regular windows.
+in newer Codex fields that BB's provider-neutral schema does not yet carry, and
+a single cached Claude OAuth usage read lifts banked-reset programs BB's
+windows omit. Both use the existing provider sign-in and never read, store, or
+return auth tokens. If the installed CLI or endpoint does not support the
+request, the panel silently falls back to BB's regular windows.
 
 The on-demand amount shown here is a provider-reported spend-control period. It
 is separate from organization-wide OpenAI Platform API billing. Exact Platform

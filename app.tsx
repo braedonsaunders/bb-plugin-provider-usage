@@ -784,7 +784,7 @@ function ProviderDetails({ provider }: { provider: ProviderUsage }) {
       value: `${count} available`,
       hint: provider.resetCredits.nextExpiresAt
         ? `${provider.resetCredits.title ?? "Next reset"} expires ${formatResetAbsolute(provider.resetCredits.nextExpiresAt)} · in ${formatResetRelative(provider.resetCredits.nextExpiresAt)}`
-        : null,
+        : provider.resetCredits.description,
     });
   }
   if (provider.spendControl) {
