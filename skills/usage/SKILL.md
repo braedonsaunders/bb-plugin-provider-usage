@@ -1,6 +1,6 @@
 ---
 name: usage
-description: Inspect remaining provider subscription usage, plans, reset windows, live token throughput, and global token totals. Use when the user asks about usage, quota, remaining limits, what is burning tokens right now, token spend over time, Codex/Claude/Cursor plan usage, or when to wait for a reset.
+description: Inspect remaining provider subscription usage, plans, reset windows, live token throughput, and global token totals. Use when the user asks about usage, quota, remaining limits, what is burning tokens right now, token spend over time, Codex/Claude/Cursor/Muse plan usage, or when to wait for a reset.
 ---
 
 # Usage dashboard
@@ -23,10 +23,13 @@ reset. Provider rows may also include `credits`, `resetCredits`, and
 `spendControl`; for Codex these expose purchased-credit balance, banked reset
 availability/expiry, and any backend-reported on-demand period. Claude
 `resetCredits` is the same shape: saved grant count plus the unused weekly
-session reset when one is still sitting on the account. A window's
+session reset when one is still sitting on the account. Muse Code reports a
+`5-hour limit` and a `Weekly limit` window as of the last Muse turn on that
+machine; an `ok` Muse row with no windows means no Muse turn has run there yet,
+so its quota is unknown rather than full. A window's
 `cost` gives exact used/limit dollars when the provider reports them. Use
 `tokens.totals` and `tokens.providers` for global Codex/Claude transcript token
-volume across Codex, Claude Code, Cursor, and opencode.
+volume across Codex, Claude Code, Cursor, opencode, and Muse Code.
 
 When a provider row has `pooled: true`, the Account Pooler is routing it across
 the logins in `accounts[]`, listed in failover order. Judge whether to wait for

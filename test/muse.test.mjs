@@ -140,3 +140,81 @@ test("a signed-in muse account is listed with its catalog identity", () => {
   assert.equal(muse?.planLabel, "High usage");
   assert.equal(muse?.windows[0]?.remainingPercent, 60);
 });
+
+const { formatDashboardText } = await import("../lib/dashboard.ts");
+const { normalizeProviderLimits } = await import("../lib/provider-limits.ts");
+
+/**
+ * What provider-muse 0.16 reports through `system.usageLimits` once a Muse
+ * host has pushed `usage/changed`: the plan's own 5-hour and weekly meters.
+ */
+const MUSE_LIMITS = {
+  status: "ok",
+  accountEmail: "dev@example.com",
+  planLabel: null,
+  windows: [
+    { label: "5-hour limit", usedPercent: 20, resetsAt: "2026-10-09T04:43:03.000Z" },
+    { label: "Weekly limit", usedPercent: 40, resetsAt: "2026-10-12T00:00:00.000Z" },
+  ],
+};
+
+function museDashboard(codexUsed) {
+  return assembleDashboard({
+    limits: normalizeProviderLimits({
+      codex: {
+        status: "ok",
+        windows: [{ label: "Weekly limit", usedPercent: codexUsed, resetsAt: null }],
+      },
+      "claude-code": { status: "not_installed" },
+      "acp-cursor": { status: "not_installed" },
+      muse: MUSE_LIMITS,
+    }),
+    hosts: [],
+    catalog: [
+      { id: "codex", displayName: "Codex", logoUrl: null },
+      { id: "muse", displayName: "Muse Code", logoUrl: null },
+    ],
+    hostId: null,
+  });
+}
+
+test("muse subscription windows reach the provider row and the sidebar total", () => {
+  const snapshot = museDashboard(0);
+  const muse = snapshot.providers.find((provider) => provider.key === "muse");
+  assert.deepEqual(
+    muse.windows.map((window) => [window.label, window.remainingPercent]),
+    [
+      ["5-hour limit", 80],
+      ["Weekly limit", 60],
+    ],
+  );
+  // The sidebar % is the mean of each provider's lead window: Codex 100, Muse 80.
+  assert.equal(snapshot.totals.cumulativeRemainingPercent, 90);
+  assert.equal(snapshot.totals.okProviders, 2);
+  assert.equal(snapshot.totals.nextResetAt, "2026-10-09T04:43:03.000Z");
+  assert.match(formatDashboardText(snapshot), /Muse Code[\s\S]*5-hour limit\s+80% left/);
+});
+
+test("a tight muse weekly window becomes the dashboard's tightest", () => {
+  const snapshot = assembleDashboard({
+    limits: normalizeProviderLimits({
+      muse: {
+        ...MUSE_LIMITS,
+        windows: [
+          MUSE_LIMITS.windows[0],
+          { ...MUSE_LIMITS.windows[1], usedPercent: 95 },
+        ],
+      },
+    }),
+    hosts: [],
+    catalog: [{ id: "muse", displayName: "Muse Code", logoUrl: null }],
+    hostId: null,
+  });
+  assert.deepEqual(snapshot.totals.tightest, {
+    providerId: "muse",
+    providerName: "Muse Code",
+    windowLabel: "Weekly limit",
+    usedPercent: 95,
+    remainingPercent: 5,
+  });
+});

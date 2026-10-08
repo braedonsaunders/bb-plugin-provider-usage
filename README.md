@@ -33,6 +33,13 @@ Codex backend reports. Claude adds the same banked-reset row: saved grant
 resets plus the unused weekly session reset (1/week) when Anthropic reports
 them.
 
+Muse Code shows its plan's own 5-hour and weekly limits — Meta's percentages
+and reset times, as Muse Code 1.4 reports them with every model response — once
+the Muse Code provider plugin (0.16 or later) has seen one Muse turn on that
+machine. Before that first turn the row shows the account without a meter. Its
+lead window counts toward the totals and the sidebar percentage like any other
+provider's.
+
 **Pooled accounts.** When the Account Pooler routes a provider across several
 logins, one meter per provider stops describing what the next request will get:
 the account at the front of the failover order can be exhausted while the pool
@@ -135,6 +142,13 @@ a single cached Claude OAuth usage read lifts banked-reset programs BB's
 windows omit. Both use the existing provider sign-in and never read, store, or
 return auth tokens. If the installed CLI or endpoint does not support the
 request, the panel silently falls back to BB's regular windows.
+
+Muse Code's windows need no extra read here: the Muse Code provider plugin keeps
+the newest `usage/changed` reading its `muse serve` hosts receive and hands it
+to `system.usageLimits` like any first-party provider. Muse has no request that
+reads the meters without spending quota, so the reading is as of the last Muse
+turn on that machine; a window whose reset has since passed is shown as
+unspent rather than as its old number.
 
 The on-demand amount shown here is a provider-reported spend-control period. It
 is separate from organization-wide OpenAI Platform API billing. Exact Platform
