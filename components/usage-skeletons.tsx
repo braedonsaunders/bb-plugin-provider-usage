@@ -163,42 +163,49 @@ export function TokenUsageSkeleton() {
   );
 }
 
-function ProviderLimitRowSkeleton() {
+/** Provider limits: the provider list on the left, the overview on the right. */
+export function ProviderLimitsSkeleton() {
   return (
-    <div className="flex flex-col gap-4 p-5 md:flex-row md:items-start md:gap-6">
-      <div className="flex min-w-0 shrink-0 items-center gap-3 md:w-60">
-        <Skeleton className="size-10 rounded-xl" />
-        <div className="min-w-0 flex-1 space-y-1.5">
-          <Skeleton className="h-4 w-24" />
-          <Skeleton className="h-3 w-36" />
-        </div>
-        <Skeleton className="size-14 shrink-0 rounded-full" />
-      </div>
-      <div className="min-w-0 flex-1 space-y-4">
-        {[0, 1].map((index) => (
-          <div key={index} className="space-y-2">
-            <div className="flex items-baseline justify-between gap-3">
-              <div className="space-y-1.5">
-                <Skeleton className="h-4 w-28" />
-                <Skeleton className="h-3 w-48" />
-              </div>
-              <Skeleton className="h-4 w-16" />
+    <div className="grid border-t border-border md:grid-cols-3" aria-hidden>
+      <div className="space-y-1 border-b border-border p-2 md:border-b-0 md:border-r">
+        {[0, 1, 2, 3, 4].map((index) => (
+          <div key={index} className="flex items-center gap-3 px-2.5 py-2">
+            <Skeleton
+              className={cn("size-8", index === 0 ? "rounded-full" : "rounded-lg")}
+            />
+            <div className="min-w-0 flex-1 space-y-1.5">
+              <Skeleton className="h-3.5 w-24" />
+              <Skeleton className="h-1 w-full rounded-full" />
             </div>
-            <Skeleton className="h-1.5 w-full rounded-full" />
           </div>
         ))}
       </div>
-    </div>
-  );
-}
-
-/** Provider limits list: three rows of mark, copy, gauge, and two bars. */
-export function ProviderLimitsSkeleton() {
-  return (
-    <div className="divide-y divide-border" aria-hidden>
-      <ProviderLimitRowSkeleton />
-      <ProviderLimitRowSkeleton />
-      <ProviderLimitRowSkeleton />
+      <div className="space-y-5 p-5 md:col-span-2">
+        <div className="flex items-center gap-7">
+          <Skeleton className="size-28 shrink-0 rounded-full" />
+          <div className="grid flex-1 grid-cols-2 gap-x-6 gap-y-4">
+            {[0, 1, 2, 3].map((index) => (
+              <div key={index} className="space-y-1.5">
+                <Skeleton className="h-2.5 w-16" />
+                <Skeleton className="h-4 w-24" />
+                <Skeleton className="h-2.5 w-28" />
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="space-y-4 rounded-xl border border-border p-3.5">
+          {[0, 1, 2].map((index) => (
+            <div key={index} className="flex items-center gap-5">
+              <Skeleton className="size-8 shrink-0 rounded-lg" />
+              <Skeleton className="h-3 w-20" />
+              <div className="grid flex-1 grid-cols-2 gap-4">
+                <Skeleton className="h-1 rounded-full" />
+                <Skeleton className="h-1 rounded-full" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

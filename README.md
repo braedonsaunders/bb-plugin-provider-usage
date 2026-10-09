@@ -18,11 +18,25 @@ BB-launched ACP sessions whose bridges do not emit them, the plugin maps the
 provider thread id back to opencode's exact local counters or Cursor's
 text-derived estimate.
 
-**Provider limits.** One pane, one row per provider: its plan, each
-rate-limit window (5-hour, weekly, monthly — whatever the provider reports), how
-much is left, and when it comes back. Every meter counts **down** — the ring,
-the bar, and the number all show what remains, the way each provider states its
-own limits. Cost-backed windows also show the amount used and the period cap.
+**Provider limits.** One section, split in two. The left third lists the
+providers — active ones first, each with its plan, the lead window's remaining
+percentage and a thin meter, then any that are not signed in. The right two
+thirds shows whatever is selected:
+
+- **Overview** (the default): the overall remaining figure the sidebar shows,
+  the tightest window anywhere, the next reset, how many providers are signed
+  in and any on-demand spend — then one compact row per provider with every
+  window side by side. Click a row to open that provider.
+- **A provider**: its plan and account, a ring for its lead window, and every
+  rate-limit window (5-hour, weekly, monthly — whatever
+  the provider reports) as a tile with what is left and when it comes back.
+  Cost-backed windows also show the amount used and the period cap.
+
+Every meter counts **down** — rings, bars and numbers all show what remains,
+the way each provider states its own limits. Providers no longer stack down the
+page: adding one adds a list row, and a pool's accounts live in that provider's
+pane rather than stretching the whole section.
+
 A provider bb ships stays listed even when it is not installed, because that is
 real news; a plugin-supplied provider such as Muse Code appears only once its
 plugin is installed.
