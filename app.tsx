@@ -24,6 +24,7 @@ import {
 } from "./lib/tokens";
 import { SERIES_STYLESHEET, providerColor } from "./lib/series-palette";
 import { LiveThroughputSection } from "./components/live-throughput";
+import { publishRailReading, railIcon } from "./components/rail-icon";
 import {
   Gauge,
   ProviderLimitsSection,
@@ -543,32 +544,43 @@ function HomepageUsage() {
   );
 }
 
-function SidebarAccessory() {
+/**
+ * Feeds the navigation-rail badge with the cumulative quota left. Renders
+ * nothing; it exists because it is a slot with plugin context, which the rail
+ * icon itself is not.
+ */
+function RailFeed() {
   const { data } = useDashboard(null, { pollMs: BACKGROUND_REFRESH_MS });
-  const remaining = data?.totals.cumulativeRemainingPercent;
-  if (remaining === null || remaining === undefined) {
-    return <Skeleton className="inline-block h-3 w-8 align-middle" />;
-  }
-  return (
-    <span
-      className={cn(
-        "text-xs font-medium tabular-nums",
-        toneText(remainingTone(remaining)),
-      )}
-    >
-      {formatPercent(remaining)}
-    </span>
-  );
+  const remaining = data?.totals.cumulativeRemainingPercent ?? null;
+
+  useEffect(() => {
+    if (remaining === null) {
+      publishRailReading(null);
+      return;
+    }
+    const tone = remainingTone(remaining);
+    publishRailReading({
+      fraction: remaining / 100,
+      tone: tone === "ok" ? "calm" : tone,
+    });
+  }, [remaining]);
+  useEffect(() => () => publishRailReading(null), []);
+
+  return null;
 }
 
+/** The panel's rail icon: the ChartColumn glyph with the live quota-left badge. */
+const RAIL_ICON = "provider-usage-rail";
+
 export default definePluginApp((app) => {
+  app.experimental_icons.register({ name: RAIL_ICON, component: railIcon("ChartColumn") });
+  app.slots.experimental_appOverlay({ id: "rail-feed", component: RailFeed });
   app.slots.navPanel({
     id: "usage",
     title: "Usage",
-    icon: "ChartColumn",
+    icon: RAIL_ICON,
     path: "usage",
     component: DashboardPage,
-    experimental_sidebarAccessory: SidebarAccessory,
   });
   app.slots.homepageSection({
     id: "usage-overview",

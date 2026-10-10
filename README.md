@@ -23,7 +23,7 @@ providers — active ones first, each with its plan, the lead window's remaining
 percentage and a thin meter, then any that are not signed in. The right two
 thirds shows whatever is selected:
 
-- **Overview** (the default): the overall remaining figure the sidebar shows,
+- **Overview** (the default): the overall remaining figure the rail badge shows,
   the tightest window anywhere, the next reset, how many providers are signed
   in and any on-demand spend — then one compact row per provider with every
   window side by side. Click a row to open that provider.
@@ -51,7 +51,7 @@ Muse Code shows its plan's own 5-hour and weekly limits — Meta's percentages
 and reset times, as Muse Code 1.4 reports them with every model response — once
 the Muse Code provider plugin (0.16 or later) has seen one Muse turn on that
 machine. Before that first turn the row shows the account without a meter. Its
-lead window counts toward the totals and the sidebar percentage like any other
+lead window counts toward the totals and the rail badge like any other
 provider's.
 
 **Pooled accounts.** When the Account Pooler routes a provider across several
@@ -112,8 +112,10 @@ nothing is counted twice.
 **Multi-machine.** If you have more than one host paired, a machine picker
 switches the whole view between them.
 
-It also contributes a homepage section and a sidebar accessory, so the tightest
-window follows you around without opening the panel.
+It also contributes a homepage section, and its icon in the navigation rail
+carries the overall remaining percentage as a small badge (muted, then red at
+30% left, then a filled red pill at 10%), so it follows you around without
+opening the panel.
 
 ## Install
 
@@ -132,7 +134,7 @@ npm install --include=dev
 bb plugin install . --yes
 ```
 
-Open **Usage** in the left sidebar.
+Open **Usage** from the navigation rail.
 
 ## CLI
 
