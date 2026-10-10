@@ -33,11 +33,13 @@ volume across Codex, Claude Code, Cursor, opencode, and Muse Code.
 
 When a provider row has `pooled: true`, the Account Pooler is routing it across
 the logins in `accounts[]`, listed in failover order. Judge whether to wait for
-a reset from the first account with `unavailable: false` — that is the one that
-will serve the next request. The row's own `windows[]` describe only the local
-credentials, which are routinely exhausted or unauthenticated while the pool
-keeps working, so do not report a pooled provider as out of quota unless every
-entry in `accounts[]` is unavailable.
+a reset from eligible accounts with `unavailable: false`. Pool observations
+are authoritative: matching emails do not identify the same credentials or
+quota tier. The row's own `windows[]` describe an eligible pooled account, or
+an exhausted account when none is eligible. Do not report a pooled provider
+as out of quota unless every entry in `accounts[]` is unavailable. Local
+credit balances and reset grants are not attributed to pooled accounts
+without verified credential identity.
 
 `bb usage live` answers "what is being burned right now": `tokensPerMinute` is
 the trailing-60-second rate, `peakTokensPerMinute` the best rate in the last 15

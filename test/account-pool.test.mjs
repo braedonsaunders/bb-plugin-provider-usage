@@ -19,6 +19,7 @@ const { normalizeAccountPool } = await import("../lib/account-pool.ts");
 const { assembleDashboard, formatDashboardText } = await import(
   "../lib/dashboard.ts"
 );
+const { heroWindow, isActive, providerAvailabilityLabel } = await import("../lib/dashboard.ts");
 
 const RESET_MS = Date.UTC(2026, 8, 15, 1, 46, 54);
 
@@ -137,7 +138,7 @@ test("a slot the pool cannot name or time is not charted", () => {
   assert.equal(timed.codex[1].windows[1].label, "Secondary limit");
 });
 
-test("the locally signed-in account keeps its named windows", () => {
+test("pool observations are authoritative even for a matching local email", () => {
   const snapshot = assembleDashboard({
     limits: {
       codex: {
@@ -164,19 +165,21 @@ test("the locally signed-in account keeps its named windows", () => {
 
   const codex = snapshot.providers.find((provider) => provider.key === "codex");
   const [local, remote] = codex.accounts;
-  assert.equal(local.local, true);
+  assert.equal(local.local, false);
   assert.equal(remote.local, false);
-  // The host names the local account's buckets; the pool only knew one window.
+  // Email is not credential identity; local model meters stay out of the pool.
   assert.deepEqual(
     local.windows.map((window) => window.label),
-    ["Weekly limit", "GPT-5.3-Codex-Spark · 5-hour limit"],
+    ["Weekly limit"],
   );
   assert.equal(remote.windows.length, 1);
 
   // Those windows belong to the account row now, not to the provider as well.
   const text = formatDashboardText(snapshot);
   assert.equal(text.match(/GPT-5\.3-Codex-Spark/g).length, 1);
-  assert.match(text, /work@example\.com · exhausted · signed in here/);
+  assert.match(text, /Local login \(separate from pool\)/);
+  assert.match(text, /work@example\.com · exhausted/);
+  assert.doesNotMatch(text, /signed in here/);
 });
 
 test("one limit read twice, seconds apart, is listed once", () => {
@@ -227,11 +230,11 @@ test("one limit read twice, seconds apart, is listed once", () => {
   const codex = snapshot.providers.find((provider) => provider.key === "codex");
   assert.deepEqual(
     codex.windows.map((window) => window.label),
-    ["Weekly limit", "GPT-5.3-Codex-Spark · 5-hour limit"],
+    ["Weekly limit"],
   );
   assert.deepEqual(
     codex.accounts[0].windows.map((window) => window.label),
-    ["Weekly limit", "GPT-5.3-Codex-Spark · 5-hour limit"],
+    ["Weekly limit"],
   );
 });
 
@@ -340,4 +343,78 @@ test("an unpooled dashboard reports no accounts", () => {
   const codex = snapshot.providers.find((provider) => provider.key === "codex");
   assert.equal(codex.pooled, false);
   assert.deepEqual(codex.accounts, []);
+});
+
+const onlyClaude = (slice, accounts, supplement) => assembleDashboard({
+  limits: {
+    codex: { status: "not_installed" }, claudeCode: slice,
+    cursor: { status: "not_installed" }, muse: { status: "not_installed" },
+  },
+  pool: { claudeCode: accounts },
+  supplements: supplement ? { claudeCode: supplement } : undefined,
+  hosts: [], catalog: [], hostId: null,
+});
+
+test("same-email Claude credentials retain distinct pool quotas and blocked state", () => {
+  const pool = normalizeAccountPool({
+    routing: { claude: true },
+    accounts: [
+      { id: "broken", provider: "claude", email: "work@example.com", status: "error",
+        fiveHourUtilization: 0, error: "invalid_grant" },
+      { id: "spent", provider: "claude", email: "work@example.com", status: "exhausted",
+        fiveHourUtilization: 1, fiveHourResetAt: RESET_MS, sevenDayUtilization: 0.21 },
+    ],
+  });
+  const snapshot = onlyClaude({ status: "ok", accountEmail: "work@example.com",
+    windows: [{ label: "Current session", usedPercent: 1, resetsAt: null }] }, pool.claudeCode,
+    { credits: null, spendControl: null, windows: [], resetCredits: { availableCount: 1, nextExpiresAt: null, title: "Local reset", description: null } });
+  const claude = snapshot.providers[0];
+  assert.equal(claude.accounts[0].windows.length, 0);
+  assert.deepEqual(claude.accounts[1].windows.map((w) => w.usedPercent), [100, 21]);
+  assert.ok(claude.accounts.every((a) => !a.local));
+  assert.equal(claude.resetCredits, null);
+  assert.equal(claude.status, "error");
+  assert.equal(heroWindow(claude), undefined);
+  assert.equal(isActive(claude), false);
+  assert.equal(providerAvailabilityLabel(claude), "No accounts available");
+  assert.equal(snapshot.totals.cumulativeRemainingPercent, 0);
+  assert.equal(snapshot.totals.okProviders, 0);
+  assert.equal(snapshot.totals.tightest.remainingPercent, 0);
+  assert.equal(snapshot.totals.nextResetAt, new Date(RESET_MS).toISOString());
+  const text = formatDashboardText(snapshot);
+  assert.doesNotMatch(text.split("Local login")[0], /99% left|Local reset/);
+  assert.match(text, /Local login[\s\S]*99% left/);
+  assert.equal(claude.localUsage.windows[0].remainingPercent, 99);
+  assert.equal(claude.localUsage.resetCredits.availableCount, 1);
+});
+
+test("usable pool fallback drives totals when the local login is unauthenticated", () => {
+  const accounts = normalizeAccountPool(poolStatus()).codex;
+  const snapshot = onlyClaude({ status: "unauthenticated" }, accounts);
+  const provider = snapshot.providers[0];
+  assert.equal(provider.status, "ok");
+  assert.equal(heroWindow(provider).remainingPercent, 100);
+  assert.equal(snapshot.totals.okProviders, 1);
+  assert.equal(snapshot.totals.cumulativeRemainingPercent, 100);
+  assert.equal(snapshot.totals.tightest.remainingPercent, 100);
+});
+
+test("an all-error pool has unknown quota and no serving gauge", () => {
+  const accounts = normalizeAccountPool({ routing: { claude: true }, accounts: [
+    { id: "broken", provider: "claude", status: "error", fiveHourUtilization: 0 },
+  ] }).claudeCode;
+  const snapshot = onlyClaude({ status: "ok", windows: [{ label: "Session", usedPercent: 0, resetsAt: null }] }, accounts);
+  assert.equal(heroWindow(snapshot.providers[0]), undefined);
+  assert.equal(snapshot.totals.cumulativeRemainingPercent, 0);
+  assert.equal(snapshot.totals.windowCount, 0);
+  assert.equal(snapshot.totals.tightest, null);
+});
+
+test("extra-usage fallback stays available despite empty subscription quota", () => {
+  const status = poolStatus();
+  status.accounts[0].status = "ready";
+  status.accounts[0].extraUsage = { status: "allowed" };
+  const accounts = normalizeAccountPool(status).codex;
+  assert.equal(accounts[0].unavailable, false);
+  assert.match(accounts[0].message, /extra usage is available/);
 });

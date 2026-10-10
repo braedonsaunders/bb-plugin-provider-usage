@@ -88,6 +88,8 @@ export interface ProviderUsage {
    * pooled, so the single-account dashboard is unchanged for everyone else.
    */
   accounts: ProviderAccountUsage[];
+  /** Local credentials are a separate source when requests route through a pool. */
+  localUsage?: Pick<ProviderUsage, "status" | "accountEmail" | "planLabel" | "message" | "windows" | "credits" | "spendControl" | "resetCredits"> | null;
 }
 
 export interface ProviderCreditBalance {
@@ -127,11 +129,7 @@ export interface ProviderAccountUsage {
   status: string;
   /** True once the pool has skipped this account for new requests. */
   unavailable: boolean;
-  /**
-   * True for the account this machine's provider CLI is signed into. That is
-   * the one account the host and the provider's own tooling can describe in
-   * full, so its windows are the named ones rather than the pool's summary.
-   */
+  /** True only when credential identity has been verified, never by email. */
   local: boolean;
   windows: UsageWindow[];
   message: string | null;
@@ -393,17 +391,37 @@ function isRegistered(
   );
 }
 
-function heroWindow(provider: ProviderUsage): UsageWindow | undefined {
+export function availableAccount(provider: ProviderUsage): ProviderAccountUsage | undefined {
+  return provider.accounts.find((account) => !account.unavailable);
+}
+
+export function tightestWindow(windows: UsageWindow[] | undefined): UsageWindow | undefined {
+  return windows?.reduce<UsageWindow | undefined>((best, window) =>
+    !best || window.remainingPercent < best.remainingPercent ? window : best,
+  undefined);
+}
+
+export function heroWindow(provider: ProviderUsage): UsageWindow | undefined {
+  if (provider.pooled) return tightestWindow(availableAccount(provider)?.windows);
   return provider.windows.find((window) => !window.cost) ?? provider.windows[0];
 }
 
+export function isActive(provider: ProviderUsage): boolean {
+  return provider.pooled ? Boolean(availableAccount(provider)) : provider.status === "ok";
+}
+
+export function providerAvailabilityLabel(provider: ProviderUsage): string {
+  if (provider.pooled) return isActive(provider) ? "Pool available" : "No accounts available";
+  return statusLabel(provider.status);
+}
+
 function buildTotals(providers: ProviderUsage[]): UsageTotals {
-  const ok = providers.filter((provider) => provider.status === "ok");
-  const windows = ok.flatMap((provider) =>
+  const ok = providers.filter(isActive);
+  const windows = providers.filter((provider) => provider.pooled || isActive(provider)).flatMap((provider) =>
     provider.windows.map((window) => ({ provider, window })),
   );
-  const heroRemaining = ok
-    .map((provider) => heroWindow(provider)?.remainingPercent)
+  const heroRemaining = providers
+    .map((provider) => provider.pooled && !isActive(provider) ? 0 : heroWindow(provider)?.remainingPercent)
     .filter((value): value is number => value !== undefined);
   const cumulativeRemainingPercent =
     heroRemaining.length === 0
@@ -502,42 +520,40 @@ export function assembleDashboard(input: {
       slice.status === "ok"
         ? mergeWindows(slice.windows, supplement?.windows)
         : [];
-    /**
-     * The host and the provider's own CLI describe a single login: the one this
-     * machine is signed into. Give that account its named windows — Codex's
-     * per-model buckets and cost-backed periods among them — and leave the
-     * other accounts with what the pool knows, which is coarser but is the only
-     * view of a login this machine never held.
-     */
-    const localEmail = slice.accountEmail?.trim().toLowerCase() ?? null;
-    const resolvedAccounts = accounts.map((account) => {
-      const isLocal =
-        localEmail !== null &&
-        account.email?.trim().toLowerCase() === localEmail;
-      if (!isLocal) return account;
-      return {
-        ...account,
-        local: true,
-        windows: windows.length > 0 ? windows : account.windows,
-      };
-    });
+    // Email (and even a shared user UUID) does not identify the credentials or
+    // quota tier. Pool observations must never be replaced by local-login data.
+    const resolvedAccounts = accounts.map((account) => ({ ...account, local: false }));
+    const pooled = resolvedAccounts.length > 0;
+    const eligible = resolvedAccounts.find((account) => !account.unavailable);
+    const representative = eligible ?? resolvedAccounts.find((account) => account.status === "exhausted")
+      ?? resolvedAccounts.find((account) => account.status === "ready");
     return {
       key,
       id: PROVIDER_META[key].id,
       displayName: identity.displayName,
       logoUrl: identity.logoUrl,
-      status: slice.status,
-      accountEmail: slice.accountEmail ?? null,
-      planLabel: slice.planLabel ?? null,
-      message: slice.message ?? null,
-      windows,
-      credits: slice.status === "ok" ? (supplement?.credits ?? null) : null,
+      status: pooled ? (eligible ? "ok" : "error") : slice.status,
+      accountEmail: pooled ? (eligible?.email ?? null) : slice.accountEmail ?? null,
+      planLabel: pooled ? null : slice.planLabel ?? null,
+      message: pooled ? (eligible ? null : "No pooled accounts are currently available.") : slice.message ?? null,
+      windows: pooled ? (representative?.windows ?? []) : windows,
+      credits: !pooled && slice.status === "ok" ? (supplement?.credits ?? null) : null,
       spendControl:
-        slice.status === "ok" ? (supplement?.spendControl ?? null) : null,
+        !pooled && slice.status === "ok" ? (supplement?.spendControl ?? null) : null,
       resetCredits:
-        slice.status === "ok" ? (supplement?.resetCredits ?? null) : null,
-      pooled: resolvedAccounts.length > 0,
+        !pooled && slice.status === "ok" ? (supplement?.resetCredits ?? null) : null,
+      pooled,
       accounts: resolvedAccounts,
+      localUsage: pooled ? {
+        status: slice.status,
+        accountEmail: slice.accountEmail ?? null,
+        planLabel: slice.planLabel ?? null,
+        message: slice.message ?? null,
+        windows,
+        credits: slice.status === "ok" ? supplement?.credits ?? null : null,
+        spendControl: slice.status === "ok" ? supplement?.spendControl ?? null : null,
+        resetCredits: slice.status === "ok" ? supplement?.resetCredits ?? null : null,
+      } : null,
     } satisfies ProviderUsage;
   });
 
@@ -561,7 +577,7 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
     `Fetched ${snapshot.fetchedAt}`,
     "",
     "Totals",
-    `  Providers        ${snapshot.totals.okProviders} signed in / ${snapshot.totals.trackedProviders} tracked`,
+    `  Providers        ${snapshot.totals.okProviders} available / ${snapshot.totals.trackedProviders} tracked`,
     // Everything below counts down, matching the panel's meters and the way
     // each provider states its own limits.
     `  Remaining        ${
@@ -621,6 +637,14 @@ export function formatDashboardText(snapshot: DashboardSnapshot): string {
       if (account.windows.length === 0) {
         lines.push("    No limit windows reported");
       }
+    }
+    if (provider.pooled && provider.localUsage) {
+      const local = provider.localUsage;
+      lines.push(`  Local login (separate from pool) · ${local.planLabel ?? statusLabel(local.status)}${local.accountEmail ? ` · ${local.accountEmail}` : ""}`);
+      for (const window of local.windows) {
+        lines.push(`    ${window.label.padEnd(16)} ${formatPercent(window.remainingPercent)} left · ${formatPercent(window.usedPercent)} used`);
+      }
+      if (local.message) lines.push(`    ${local.message}`);
     }
     if (provider.status !== "ok") {
       lines.push(`  ${statusLabel(provider.status)}${provider.message ? ` — ${provider.message}` : ""}`);

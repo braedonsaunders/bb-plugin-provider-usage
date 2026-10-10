@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { abortableDelay } from "./lib/abort-delay";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -6,9 +7,6 @@ import {
   assembleDashboard,
   formatDashboardText,
   type DashboardSnapshot,
-  type ProviderKey,
-  type ProviderLimitSlice,
-  type ProviderSupplement,
   type UsageHost,
 } from "./lib/dashboard";
 import {
@@ -20,12 +18,13 @@ import {
 import {
   mergeDaily,
   scanBbThreadUsage,
+  readAllUsageEvents,
   type BbUsageEvent,
   type BbUsageTotal,
 } from "./lib/bb-usage-scan";
 import {
   TOKEN_WINDOWS,
-  assembleTokenSnapshot,
+  createTokenRangeStore,
   dayKey,
   formatTokenText,
   type TokenBucket,
@@ -47,13 +46,7 @@ import { createCursorLiveThroughputSource } from "./lib/cursor-scan";
 import { readAccountPool } from "./lib/account-pool";
 import { readClaudeUsageSupplement } from "./lib/claude-usage";
 import { readCodexUsageSupplement } from "./lib/codex-usage";
-import {
-  hasRateLimitedProvider,
-  overlayLastGoodLimits,
-  rememberGoodLimits,
-  shouldReuseCachedLimits,
-} from "./lib/limits-cache";
-import { normalizeProviderLimits } from "./lib/provider-limits";
+import { createLimitsStore, type LimitsSnapshot } from "./lib/limit-store";
 
 const usageWindowSchema = z.object({
   label: z.string(),
@@ -123,6 +116,16 @@ const providerUsageSchema = z.object({
       message: z.string().nullable(),
     }),
   ),
+  localUsage: z.object({
+    status: z.enum(["ok", "not_installed", "unauthenticated", "expired", "error"]),
+    accountEmail: z.string().nullable(),
+    planLabel: z.string().nullable(),
+    message: z.string().nullable(),
+    windows: z.array(usageWindowSchema),
+    credits: z.object({ hasCredits: z.boolean(), unlimited: z.boolean(), balance: z.string().nullable() }).nullable(),
+    spendControl: z.object({ used: z.string(), limit: z.string(), remainingPercent: z.number(), resetsAt: z.string().nullable(), reached: z.boolean().nullable() }).nullable(),
+    resetCredits: z.object({ availableCount: z.number().int(), nextExpiresAt: z.string().nullable(), title: z.string().nullable(), description: z.string().nullable() }).nullable(),
+  }).nullable().optional(),
 });
 
 const dashboardSchema = z.object({
@@ -266,26 +269,6 @@ export const rpcContract = defineRpcContract({
   },
 });
 
-type LastGoodLimits = Partial<Record<ProviderKey, ProviderLimitSlice>>;
-
-type LastFetch = {
-  at: number;
-  hostId: string | null;
-  limits: Record<ProviderKey, ProviderLimitSlice>;
-  rateLimitedAt: number | null;
-  /**
-   * Claude extras (banked resets) are a second Anthropic call. Cache them
-   * with the windows so a UI refresh does not 429 the usage endpoint. `null`
-   * means we asked and there was nothing to show; omitted is a pre-0.11 cache.
-   */
-  claudeSupplement?: ProviderSupplement | null;
-};
-
-type LimitsSnapshot = {
-  limits: Record<ProviderKey, ProviderLimitSlice>;
-  claudeSupplement: ProviderSupplement | null;
-};
-
 function createLimitStore(bb: BbPluginApi) {
   const db = bb.storage.database();
   const read = db.prepare("SELECT value FROM limits_cache WHERE key = ?");
@@ -293,87 +276,17 @@ function createLimitStore(bb: BbPluginApi) {
     `INSERT INTO limits_cache (key, value) VALUES (?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
   );
-
-  const readJson = <T>(key: string): T | null => {
-    const row = read.get(key) as { value?: string } | undefined;
-    if (!row?.value) return null;
-    try {
-      return JSON.parse(row.value) as T;
-    } catch {
-      return null;
-    }
-  };
-
-  let lastGood = readJson<LastGoodLimits>("last-good") ?? {};
-  let lastFetch = readJson<LastFetch>("last-fetch");
-  let inflight: Promise<LimitsSnapshot> | null = null;
-
-  const persist = () => {
-    write.run("last-good", JSON.stringify(lastGood));
-    if (lastFetch) write.run("last-fetch", JSON.stringify(lastFetch));
-  };
-
-  const snapshotFrom = (
-    limits: Record<ProviderKey, ProviderLimitSlice>,
-    claudeSupplement: ProviderSupplement | null,
-  ): LimitsSnapshot => ({ limits, claudeSupplement });
-
-  const readLive = async (hostId: string | null): Promise<LimitsSnapshot> => {
-    const [raw, claude] = await Promise.all([
-      bb.sdk.system.usageLimits(hostId ? { hostId } : {}),
-      hostId === null
-        ? readClaudeUsageSupplement()
-        : Promise.resolve(null),
-    ]);
-    const fresh = normalizeProviderLimits(raw);
-    const limits = overlayLastGoodLimits(fresh, lastGood);
-    lastGood = rememberGoodLimits(limits, lastGood);
-    // A 429 or timeout must not blank a reset we already showed.
-    const claudeSupplement = claude ?? lastFetch?.claudeSupplement ?? null;
-    lastFetch = {
-      at: Date.now(),
-      hostId,
-      limits,
-      rateLimitedAt: hasRateLimitedProvider(fresh) ? Date.now() : null,
-      claudeSupplement,
-    };
-    persist();
-    if (hasRateLimitedProvider(fresh)) {
-      bb.log.warn(
-        "usage limits: a provider was rate-limited; serving last good windows",
-      );
-    }
-    return snapshotFrom(limits, claudeSupplement);
-  };
-
-  const get = async (
-    hostId: string | null,
-    force = false,
-  ): Promise<LimitsSnapshot> => {
-    if (
-      lastFetch &&
-      lastFetch.hostId === hostId &&
-      lastFetch.claudeSupplement !== undefined &&
-      shouldReuseCachedLimits({
-        nowMs: Date.now(),
-        fetchedAtMs: lastFetch.at,
-        rateLimitedAtMs: lastFetch.rateLimitedAt,
-        force,
-      })
-    ) {
-      return snapshotFrom(lastFetch.limits, lastFetch.claudeSupplement ?? null);
-    }
-    if (inflight && !force) return inflight;
-    const run = readLive(hostId);
-    inflight = run;
-    try {
-      return await run;
-    } finally {
-      if (inflight === run) inflight = null;
-    }
-  };
-
-  return { get };
+  return createLimitsStore({
+    read: (key) => {
+      const row = read.get(key) as { value?: string } | undefined;
+      try { return row?.value ? JSON.parse(row.value) : null; }
+      catch { return null; }
+    },
+    write: (key, value) => { write.run(key, JSON.stringify(value)); },
+    fetchLimits: (hostId) => bb.sdk.system.usageLimits(hostId ? { hostId } : {}),
+    fetchClaude: readClaudeUsageSupplement,
+    onRateLimit: () => bb.log.warn("usage limits: a provider was rate-limited; serving last good windows"),
+  });
 }
 
 async function loadDashboard(
@@ -391,8 +304,11 @@ async function loadDashboard(
       status: host.status,
     }),
   );
-  const resolvedHostId =
-    hostId && hosts.some((host) => host.id === hostId) ? hostId : null;
+  if (hostId && !hosts.some((host) => host.id === hostId)) {
+    throw new Error(`Unknown machine: ${hostId}`);
+  }
+  const info = await bb.sdk.system.config();
+  const resolvedHostId = hostId === info.primaryHostId ? null : hostId;
   const [snapshot, catalog] = await Promise.all([
     limitsStore.get(resolvedHostId, force),
     bb.sdk.providers.list(resolvedHostId ? { hostId: resolvedHostId } : {}),
@@ -559,6 +475,8 @@ function createTokenStore(bb: BbPluginApi) {
 
   let inflight: Promise<TokenSnapshot> | null = null;
   let lastSnapshot: TokenSnapshot | null = null;
+  const ranges = createTokenRangeStore();
+  let lastBbUsage: Awaited<ReturnType<typeof scanBbThreadUsage>> = { daily: {}, providers: [], threadsScanned: 0 };
 
   const publish = () => {
     bb.realtime.publish("tokens", { at: Date.now() });
@@ -606,14 +524,14 @@ function createTokenStore(bb: BbPluginApi) {
       daily: Record<string, Record<string, TokenBucket>>;
     },
   ) => {
-    const snapshot = assembleTokenSnapshot({
-      days,
+    ranges.update({
       fileCount: scanned.files.length,
       changedFiles: scanned.changedFiles,
       retainedFiles: scanned.retainedFiles,
       sources: scanned.sources,
       daily: scanned.daily,
     });
+    const snapshot = ranges.get(days)!;
     lastSnapshot = snapshot;
     writeMeta.run("last-scan", snapshot.scannedAt);
     return snapshot;
@@ -653,13 +571,6 @@ function createTokenStore(bb: BbPluginApi) {
     bb.log.info(`token ledger pruned ${dead.length} aged-out deleted files`);
   };
 
-  const hasCursorCache = () =>
-    [...loadCache.keys()].some(
-      (path) => path.includes("acp-sessions") || path.endsWith("store.db"),
-    );
-  const hasOpencodeCache = () =>
-    [...loadCache.keys()].some((path) => path.endsWith("opencode.db"));
-
   const paintCachedStores = (
     scanned: {
       sources: string[];
@@ -677,9 +588,11 @@ function createTokenStore(bb: BbPluginApi) {
    * reports usage. Providers with a dedicated transcript scanner are skipped
    * inside scanBbThreadUsage so they are not counted twice.
    */
-  const scanBbThreads = async (nowMs: number) =>
-    scanBbThreadUsage({
+  const scanBbThreads = async (nowMs: number) => {
+    const info = await bb.sdk.system.config();
+    return scanBbThreadUsage({
       nowMs,
+      localHostId: info.primaryHostId,
       onError: (error) =>
         bb.log.warn(
           `bb thread usage scan: ${error instanceof Error ? error.message : String(error)}`,
@@ -690,13 +603,17 @@ function createTokenStore(bb: BbPluginApi) {
           id: row.id,
           providerId: row.providerId,
           updatedAt: row.updatedAt,
+          hostId: row.environmentHostId,
         }));
       },
       listEvents: async (threadId) => {
-        const rows = await bb.sdk.threads.events.list({
+        const rows = await readAllUsageEvents((page) => bb.sdk.threads.events.list({
           threadId,
           types: ["thread/tokenUsage/updated"],
-        });
+          order: page.order,
+          limit: String(page.limit),
+          ...(page.afterSeq === undefined ? {} : { afterSeq: String(page.afterSeq) }),
+        }));
         const events: BbUsageEvent[] = [];
         for (const row of rows) {
           if (row.type !== "thread/tokenUsage/updated") continue;
@@ -707,9 +624,13 @@ function createTokenStore(bb: BbPluginApi) {
         return events;
       },
     });
+  };
 
   const sync = async (days: TokenWindowDays, force = false) => {
-    if (inflight) return inflight;
+    if (inflight) {
+      await inflight;
+      return ranges.get(days)!;
+    }
     inflight = (async () => {
       const nowMs = Date.now();
       const cached = force ? new Map() : loadCache;
@@ -724,7 +645,9 @@ function createTokenStore(bb: BbPluginApi) {
         includeOpencode: false,
       });
       persistFiles(jsonl.files);
-      if (!force) paintCachedStores(jsonl);
+      paintCachedStores(jsonl);
+      mergeDaily(jsonl.daily, lastBbUsage.daily);
+      jsonl.sources.push(...lastBbUsage.providers);
       snapshotFrom(days, jsonl);
       publish();
       bb.log.info(
@@ -733,13 +656,14 @@ function createTokenStore(bb: BbPluginApi) {
 
       const phase2Started = Date.now();
       const full = await scanTokenFiles({
-        cached: loadCache,
+        cached: force ? new Map() : loadCache,
         retained: loadCache,
         includeCursor: true,
         includeOpencode: true,
       });
       persistFiles(full.files);
       const bbUsage = await scanBbThreads(nowMs);
+      lastBbUsage = bbUsage;
       mergeDaily(full.daily, bbUsage.daily);
       full.sources.push(...bbUsage.providers);
       bb.log.info(
@@ -762,32 +686,15 @@ function createTokenStore(bb: BbPluginApi) {
   const get = async (days: TokenWindowDays, force = false) => {
     if (force) return sync(days, true);
     if (lastSnapshot) {
-      if (lastSnapshot.days !== days) {
-        const scanned = await scanTokenFiles({
-          cached: loadCache,
-          retained: loadCache,
-          includeCursor: hasCursorCache(),
-          includeOpencode: hasOpencodeCache(),
-        });
-        paintCachedStores(scanned);
-        return assembleTokenSnapshot({
-          days,
-          fileCount: scanned.files.length,
-          changedFiles: scanned.changedFiles,
-          retainedFiles: scanned.retainedFiles,
-          sources: scanned.sources,
-          daily: scanned.daily,
-        });
-      }
       if (!inflight) {
         const lastScan = (
           readMeta.get("last-scan") as { value?: string } | undefined
         )?.value;
         const stale =
           !lastScan || Date.now() - Date.parse(lastScan) >= 120_000;
-        if (stale) void sync(days);
+        if (stale) void sync(days).catch((error) => bb.log.warn(`token scan failed: ${String(error)}`));
       }
-      return lastSnapshot;
+      return ranges.get(days)!;
     }
     const jsonl = await scanTokenFiles({
       cached: loadCache,
@@ -798,7 +705,7 @@ function createTokenStore(bb: BbPluginApi) {
     persistFiles(jsonl.files);
     paintCachedStores(jsonl);
     const snapshot = snapshotFrom(days, jsonl);
-    void sync(days);
+    void sync(days).catch((error) => bb.log.warn(`token scan failed: ${String(error)}`));
     return snapshot;
   };
 
@@ -975,17 +882,7 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
       while (!signal.aborted) {
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, 15 * 60_000);
-          signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              resolve();
-            },
-            { once: true },
-          );
-        });
+        await abortableDelay(signal, 15 * 60_000);
         if (signal.aborted) break;
         try {
           await tokens.sync(30);
@@ -1036,17 +933,7 @@ export default async function plugin(bb: BbPluginApi) {
           );
         }
         if (signal.aborted) break;
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, throughput.intervalMs());
-          signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              resolve();
-            },
-            { once: true },
-          );
-        });
+        await abortableDelay(signal, throughput.intervalMs());
       }
       unsubscribe?.();
     },

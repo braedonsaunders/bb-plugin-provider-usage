@@ -10,6 +10,11 @@ import {
 } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import {
+  availableAccount,
+  heroWindow,
+  isActive,
+  providerAvailabilityLabel,
+  tightestWindow,
   formatCreditAmount,
   formatFetchedAt,
   formatPercent,
@@ -24,6 +29,7 @@ import {
   type RemainingTone,
   type UsageWindow,
 } from "@/lib/dashboard";
+export { heroWindow } from "@/lib/dashboard";
 import { ProviderLimitsSkeleton } from "@/components/usage-skeletons";
 
 export function toneText(tone: RemainingTone): string {
@@ -130,56 +136,17 @@ export function Gauge({
   );
 }
 
-/** The window that decides an account's fate: whichever has least left. */
-function tightestWindow(
-  windows: UsageWindow[] | undefined,
-): UsageWindow | undefined {
-  if (!windows || windows.length === 0) return undefined;
-  return windows.reduce((tightest, window) =>
-    window.remainingPercent < tightest.remainingPercent ? window : tightest,
-  );
-}
-
-function servingAccount(
-  provider: ProviderUsage,
-): ProviderAccountUsage | undefined {
-  return (
-    provider.accounts.find((account) => !account.unavailable) ??
-    provider.accounts[0]
-  );
-}
-
-/**
- * The window a provider's gauge should show. For a pooled provider that is the
- * account which will serve the next request: the host still reports the local
- * login's quota, which can read empty while the pool is routing elsewhere.
- */
-export function heroWindow(provider: ProviderUsage): UsageWindow | undefined {
-  if (!provider.pooled) return provider.windows[0];
-  // The ring answers "how much is left before work stops", which for a pooled
-  // provider is the tightest window of the account about to take that work.
-  return tightestWindow(servingAccount(provider)?.windows);
-}
-
 /** The windows that describe a provider's next request, in reported order. */
 function displayWindows(provider: ProviderUsage): UsageWindow[] {
   if (!provider.pooled) return provider.windows;
-  return servingAccount(provider)?.windows ?? [];
-}
-
-/**
- * A provider is listed as active when it can take work: signed in, or routed
- * through a pool that can serve it whatever the local login says.
- */
-function isActive(provider: ProviderUsage): boolean {
-  return provider.status === "ok" || provider.pooled;
+  return availableAccount(provider)?.windows ?? [];
 }
 
 function providerSubtitle(provider: ProviderUsage): string {
   return [
     provider.planLabel,
     provider.pooled
-      ? `${provider.accounts.length} accounts`
+      ? `${provider.accounts.filter((account) => !account.unavailable).length}/${provider.accounts.length} available`
       : provider.status === "ok"
         ? null
         : statusLabel(provider.status),
@@ -366,19 +333,16 @@ function ProviderDetails({ provider }: { provider: ProviderUsage }) {
   );
 }
 
-type AccountRole = "serving" | "standby" | "unavailable";
+type AccountRole = "serving" | "unavailable";
 
 function accountRole(
   account: ProviderAccountUsage,
-  servingId: string | null,
 ): AccountRole {
-  if (account.id === servingId) return "serving";
-  return account.unavailable ? "unavailable" : "standby";
+  return account.unavailable ? "unavailable" : "serving";
 }
 
 const ROLE_LABEL: Record<AccountRole, string> = {
-  serving: "Serving now",
-  standby: "Standby",
+  serving: "Available",
   unavailable: "Unavailable",
 };
 
@@ -402,7 +366,7 @@ function PoolAccountRow({
   onToggle: () => void;
 }) {
   const tightest = tightestWindow(account.windows);
-  const tone = tightest ? remainingTone(tightest.remainingPercent) : null;
+  const tone = account.unavailable ? "critical" : tightest ? remainingTone(tightest.remainingPercent) : null;
   const statusText = role === "unavailable" ? account.status : ROLE_LABEL[role];
   // Provider-wide extras (credits, banked resets, on-demand spend) are read
   // from the local login, so they belong to that account rather than floating
@@ -429,9 +393,7 @@ function PoolAccountRow({
             "size-2 shrink-0 rounded-full",
             role === "serving"
               ? "bg-emerald-500"
-              : role === "standby"
-                ? "bg-muted-foreground/40"
-                : "bg-destructive/70",
+              : "bg-destructive/70",
           )}
         />
         <span className="min-w-0 flex-1">
@@ -528,7 +490,7 @@ function PoolAccounts({ provider }: { provider: ProviderUsage }) {
           <PoolAccountRow
             key={account.id}
             account={account}
-            role={accountRole(account, servingId)}
+            role={accountRole(account)}
             provider={provider}
             open={openIds.includes(account.id)}
             onToggle={() => toggle(account.id)}
@@ -621,7 +583,7 @@ function ProviderListItem({
           />
         ) : (
           <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
-            {active ? "No window reported yet" : statusLabel(provider.status)}
+            {active ? "No window reported yet" : providerAvailabilityLabel(provider)}
           </span>
         )}
       </span>
@@ -649,7 +611,7 @@ function OverviewListItem({
       <span className="min-w-0 flex-1">
         <span className="block text-sm font-medium">Overview</span>
         <span className="block truncate text-[11px] text-muted-foreground">
-          {data.totals.okProviders} signed in
+          {data.totals.okProviders} available
           {data.totals.nextResetAt
             ? ` · next reset in ${formatResetRelative(data.totals.nextResetAt)}`
             : ""}
@@ -733,7 +695,7 @@ function LimitsOverview({
   onSelect: (id: string) => void;
 }) {
   const { totals } = data;
-  const active = data.providers.filter(isActive);
+  const active = data.providers.filter((provider) => isActive(provider) || provider.pooled);
   return (
     <div className="space-y-5">
       <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:gap-7">
@@ -776,7 +738,7 @@ function LimitsOverview({
           />
           <Stat
             label="Providers"
-            value={`${totals.okProviders} of ${totals.trackedProviders} signed in`}
+            value={`${totals.okProviders} of ${totals.trackedProviders} available`}
             hint={`${totals.windowCount} limit windows`}
           />
           {totals.spend ? (
@@ -836,7 +798,7 @@ function LimitsOverview({
                   </span>
                 ) : (
                   <span className="text-xs text-muted-foreground">
-                    No subscription window reported yet
+                    {isActive(provider) ? "No subscription window reported yet" : providerAvailabilityLabel(provider)}
                   </span>
                 )}
               </button>
@@ -875,7 +837,7 @@ function ProviderDetail({ provider }: { provider: ProviderUsage }) {
           <div className="flex items-center gap-3">
             <div className="hidden text-right sm:block">
               <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                {provider.pooled ? "Serving account" : hero.label}
+                {provider.pooled ? "Available account" : hero.label}
               </p>
               <p className="text-[11px] text-muted-foreground">
                 {hero.resetsAt ? `resets in ${formatResetRelative(hero.resetsAt)}` : " "}
@@ -895,8 +857,35 @@ function ProviderDetail({ provider }: { provider: ProviderUsage }) {
           {emptyStateText(provider)}
         </p>
       )}
+      {provider.pooled && provider.localUsage ? (
+        <div className="space-y-3 border-t border-border/60 pt-4">
+          <div>
+            <h4 className="text-sm font-medium">Local login</h4>
+            <p className="text-xs text-muted-foreground">
+              {[provider.localUsage.planLabel, provider.localUsage.accountEmail].filter(Boolean).join(" · ")}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              These credentials have their own usage reading. Threads currently route through the pool above.
+            </p>
+          </div>
+          {provider.localUsage.status === "ok" ? (
+            <>
+              <WindowGrid windows={provider.localUsage.windows} />
+              {provider.localUsage.message ? <p className="text-xs text-muted-foreground">{provider.localUsage.message}</p> : null}
+              <ProviderDetails provider={{ ...provider, ...provider.localUsage, pooled: false, accounts: [], localUsage: null }} />
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {statusLabel(provider.localUsage.status)}{provider.localUsage.message ? ` · ${provider.localUsage.message}` : ""}
+            </p>
+          )}
+        </div>
+      ) : null}
       {provider.status === "ok" && !provider.pooled ? (
-        <ProviderDetails provider={provider} />
+        <>
+          {provider.message ? <p className="text-xs text-muted-foreground">{provider.message}</p> : null}
+          <ProviderDetails provider={provider} />
+        </>
       ) : null}
     </div>
   );

@@ -179,7 +179,6 @@ export function normalizeClaudeUsage(value: unknown): ProviderSupplement | null 
   const resetCredits = mergeResetCredits(
     weekly ? [...grants, weekly] : grants,
   );
-  if (!resetCredits) return null;
   return {
     windows: [],
     credits: null,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type PointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,7 @@ import { cn } from "@/lib/utils";
 import {
   formatPercent,
   remainingTone,
-  statusLabel,
+  providerAvailabilityLabel,
   type DashboardSnapshot,
   type RemainingTone,
 } from "./lib/dashboard";
@@ -59,9 +59,11 @@ function useDashboard(
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const latestRequest = useRef(0);
 
   const load = useCallback(
     async (mode: "initial" | "refresh" | "force" = "refresh") => {
+      const request = ++latestRequest.current;
       if (mode === "initial") setLoading(true);
       else setRefreshing(true);
       try {
@@ -69,22 +71,29 @@ function useDashboard(
           hostId,
           force: mode === "force",
         });
+        if (request !== latestRequest.current) return;
         setData(next);
         setError(null);
       } catch (cause) {
+        if (request !== latestRequest.current) return;
         const message =
           cause instanceof Error ? cause.message : "Could not load usage.";
         setError(message);
       } finally {
-        setLoading(false);
-        setRefreshing(false);
+        if (request === latestRequest.current) {
+          setLoading(false);
+          setRefreshing(false);
+        }
       }
     },
     [hostId, rpc],
   );
 
   useEffect(() => {
+    setData(null);
+    setError(null);
     void load("initial");
+    return () => { latestRequest.current += 1; };
   }, [load]);
 
   useEffect(() => {
@@ -109,17 +118,21 @@ function useTokens(days: TokenWindowDays) {
   const [data, setData] = useState<TokenSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const latestRequest = useRef(0);
 
   const load = useCallback(
     async (force = false) => {
+      const request = ++latestRequest.current;
       try {
         const next = await rpc.call("getTokens", { days, force });
+        if (request !== latestRequest.current) return;
         setData(next);
         setError(null);
       } catch (cause) {
+        if (request !== latestRequest.current) return;
         setError(cause instanceof Error ? cause.message : "Could not load tokens.");
       } finally {
-        setLoading(false);
+        if (request === latestRequest.current) setLoading(false);
       }
     },
     [days, rpc],
@@ -127,7 +140,10 @@ function useTokens(days: TokenWindowDays) {
 
   useEffect(() => {
     setLoading(true);
+    setData(null);
+    setError(null);
     void load();
+    return () => { latestRequest.current += 1; };
   }, [load]);
 
   useRealtime("tokens", () => {
@@ -533,7 +549,7 @@ function HomepageUsage() {
                 <p className="truncate text-xs text-muted-foreground">
                   {hero
                     ? `${hero.label} · ${formatPercent(hero.remainingPercent)} left`
-                    : statusLabel(provider.status)}
+                    : providerAvailabilityLabel(provider)}
                 </p>
               </div>
             </CardContent>

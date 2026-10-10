@@ -12,12 +12,14 @@ export const SCANNED_PROVIDERS: ReadonlySet<string> = new Set([
   "claude-code",
   "cursor",
   "opencode",
+  "muse",
 ]);
 
 export interface BbThreadRef {
   id: string;
   providerId: string;
   updatedAt: number;
+  hostId?: string | null;
 }
 
 export interface BbUsageTotal {
@@ -98,11 +100,30 @@ export interface BbUsageScanResult {
   threadsScanned: number;
 }
 
+/** Read every usage event, keeping individual SDK requests under the 100-row cap. */
+export async function readAllUsageEvents<T extends { seq: number }>(
+  readPage: (args: { afterSeq?: number; order: "asc"; limit: number }) => Promise<T[]>,
+): Promise<T[]> {
+  const events: T[] = [];
+  let afterSeq: number | undefined;
+  while (true) {
+    const page = await readPage({ order: "asc", limit: 100, ...(afterSeq === undefined ? {} : { afterSeq }) });
+    if (page.length === 0) break;
+    const nextSeq = Math.max(...page.map((row) => row.seq));
+    if (afterSeq !== undefined && nextSeq <= afterSeq) throw new Error("Usage event page did not advance.");
+    events.push(...page.filter((row) => afterSeq === undefined || row.seq > afterSeq));
+    afterSeq = nextSeq;
+    if (page.length < 100) break;
+  }
+  return events;
+}
+
 export async function scanBbThreadUsage(deps: {
   listThreads: () => Promise<BbThreadRef[]>;
   listEvents: (threadId: string) => Promise<BbUsageEvent[]>;
   nowMs?: number;
   covered?: ReadonlySet<string>;
+  localHostId?: string | null;
   onError?: (error: unknown) => void;
 }): Promise<BbUsageScanResult> {
   const nowMs = deps.nowMs ?? Date.now();
@@ -122,7 +143,8 @@ export async function scanBbThreadUsage(deps: {
 
   for (const thread of threads) {
     const providerId = normalizeProviderId(thread.providerId);
-    if (covered.has(providerId)) continue;
+    const remote = Boolean(deps.localHostId && thread.hostId && thread.hostId !== deps.localHostId);
+    if (!remote && covered.has(providerId)) continue;
     if (thread.updatedAt > 0 && thread.updatedAt < cutoff) continue;
 
     let events: BbUsageEvent[];

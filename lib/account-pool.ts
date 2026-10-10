@@ -178,11 +178,17 @@ export function normalizeAccountPool(
       status,
       unavailable:
         status !== "ready" || (heldUntil !== null && heldUntil > nowMs),
-      // Resolved against the host's signed-in account when the dashboard is
-      // assembled; the pool itself has no view of which login the CLI holds.
+      // The pool cannot verify the local CLI's credential identity.
       local: false,
-      windows,
-      message: nonEmptyString(account.error),
+      // An authentication error makes the retained quota observations stale.
+      windows: status === "error" ? [] : windows,
+      message: nonEmptyString(account.error)
+        ?? (heldUntil !== null && heldUntil > nowMs
+          ? `Temporarily rate limited until ${isoTimestamp(heldUntil)}.`
+          : status === "ready" && windows.some((window) => window.remainingPercent === 0)
+            && asRecord(account.extraUsage)?.status === "allowed"
+            ? "Subscription quota exhausted; extra usage is available."
+            : null),
     });
   }
 

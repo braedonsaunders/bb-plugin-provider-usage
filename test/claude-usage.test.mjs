@@ -132,10 +132,10 @@ test("paused grants and empty payloads disappear instead of faking a zero", () =
       cedar_ember: {
         grants: [{ id: "x", resets_left: 1, paused: true }],
       },
-    }),
+    })?.resetCredits,
     null,
   );
-  assert.equal(normalizeClaudeUsage({ five_hour: { utilization: 10 } }), null);
+  assert.equal(normalizeClaudeUsage({ five_hour: { utilization: 10 } })?.resetCredits, null);
   assert.equal(normalizeClaudeUsage(null), null);
 });
 

@@ -54,39 +54,25 @@ machine. Before that first turn the row shows the account without a meter. Its
 lead window counts toward the totals and the rail badge like any other
 provider's.
 
-**Pooled accounts.** When the Account Pooler routes a provider across several
-logins, one meter per provider stops describing what the next request will get:
-the account at the front of the failover order can be exhausted while the pool
-as a whole is fine. Such a provider becomes an overview instead of a stack of
-bars: one row per enabled account in failover order, each collapsed to the line
-that answers "can this account take work?" — whether it is serving, on standby
-or unavailable, and how much its tightest window has left. Opening a row shows
-the windows behind that answer. The account serving new requests opens by
-default, since it is the only one whose numbers describe the next request, and
-the provider's ring follows it rather than whichever login the CLI happens to
-hold. A pooled provider stays on the dashboard even when the host reports
-nothing for its local credentials, which is the normal state once routing is
-on.
+**Pooled accounts.** With routing enabled, each account shows the quota and
+availability reported by `bb pool status --json`. Pool observations remain
+separate from the machine's local login: a matching email or user UUID does
+not prove that two credentials share the same quota tier. Local credit balances
+and banked resets are not assigned to pool accounts without verified credential
+identity. The separate **Local login** section shows those credentials' quota
+and extras without changing the pool meters or the overview totals.
 
-The host and the provider's own CLI can only describe one login: the account
-this machine is signed into. That account keeps its named windows — Codex's
-per-model buckets and cost-backed periods among them — and is marked "signed in
-here"; the other accounts show what the pool knows, which is coarser but is the
-only view of a login this machine never held. A window the pool cannot yet name
-or time is left out rather than drawn as a full one, because the pool posts a
-slot as soon as a response header mentions it, before it knows the window's
-length or when it turns over.
+The provider gauge shows an eligible account's tightest window. When every
+account is unavailable, the gauge is hidden and the panel says so. Quota
+observations from an account with an authentication error are hidden because
+its credentials can no longer refresh them. Temporary holds and extra-usage
+fallbacks are explained in the account details. Availability is the pool's
+account-level state; a selected model can have additional limits.
 
-Accounts are read from `bb pool status --json` on the machine bb runs on, so
-nothing here touches the pool's stored tokens. Providers are matched by the
-pooler's own names (`codex`, `claude`), and a provider whose routing switch is
-off is left alone — bb still hands it its own credentials, so the pool's numbers
-would describe traffic that is not flowing there. The pooler is experimental and
-says its CLI can change between releases; every field is parsed defensively, and
-a pool that cannot be read leaves the dashboard exactly as it was.
-
-The totals row still aggregates each provider's host-reported windows, so
-"tightest" and "next reset" do not yet account for pooled accounts.
+Overview totals use pooled observations for routed providers, including the
+tightest window and next reset. Blocked pools contribute zero to the overall
+remaining figure. Providers with routing disabled keep their local-login
+meters. Account reads do not expose or modify stored credentials.
 
 **Token usage, for every provider.** A 7 / 30 / 90-day multi-series chart of
 real token volume, broken out into total, uncached input, output, and cached,

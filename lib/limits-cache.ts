@@ -35,10 +35,14 @@ export function overlayLastGoodLimits(
     const current = next[key];
     const prior = lastGood[key];
     if (!isRateLimitedSlice(current) || prior?.status !== "ok") continue;
+    const email = current.accountEmail?.trim().toLowerCase();
+    if (email && email !== prior.accountEmail?.trim().toLowerCase()) continue;
+    if (current.planLabel && prior.planLabel && current.planLabel !== prior.planLabel) continue;
     next[key] = {
       ...prior,
       planLabel: current.planLabel ?? prior.planLabel,
       accountEmail: current.accountEmail ?? prior.accountEmail,
+      message: "Showing cached usage because the provider's usage endpoint is rate limited.",
     };
   }
   return next;

@@ -196,6 +196,19 @@ export function assembleTokenSnapshot(input: {
   };
 }
 
+/** Project the same complete ledger into a new range without rescanning sources. */
+export function createTokenRangeStore() {
+  let latest: Omit<Parameters<typeof assembleTokenSnapshot>[0], "days"> | null = null;
+  return {
+    update(input: Omit<Parameters<typeof assembleTokenSnapshot>[0], "days">) {
+      latest = { ...input, scannedAt: input.scannedAt ?? new Date().toISOString() };
+    },
+    get(days: TokenWindowDays): TokenSnapshot | null {
+      return latest ? assembleTokenSnapshot({ ...latest, days }) : null;
+    },
+  };
+}
+
 export function formatTokenText(snapshot: TokenSnapshot): string {
   const lines = [
     `Token usage · last ${snapshot.days} days`,
