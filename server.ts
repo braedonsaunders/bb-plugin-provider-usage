@@ -46,6 +46,7 @@ import { createCursorLiveThroughputSource } from "./lib/cursor-scan";
 import { readAccountPool } from "./lib/account-pool";
 import { readClaudeUsageSupplement } from "./lib/claude-usage";
 import { readCodexUsageSupplement } from "./lib/codex-usage";
+import { readAntigravityUsage } from "./lib/antigravity-usage";
 import { createLimitsStore, type LimitsSnapshot } from "./lib/limit-store";
 
 const usageWindowSchema = z.object({
@@ -283,7 +284,16 @@ function createLimitStore(bb: BbPluginApi) {
       catch { return null; }
     },
     write: (key, value) => { write.run(key, JSON.stringify(value)); },
-    fetchLimits: (hostId) => bb.sdk.system.usageLimits(hostId ? { hostId } : {}),
+    fetchLimits: async (hostId) => {
+      const [raw, catalog] = await Promise.all([
+        bb.sdk.system.usageLimits(hostId ? { hostId } : {}),
+        bb.sdk.providers.list(hostId ? { hostId } : {}),
+      ]);
+      if (!catalog.some((provider) => provider.id === "acp-antigravity")) return raw;
+      return { ...raw, "acp-antigravity": hostId === null
+        ? await readAntigravityUsage()
+        : raw["acp-antigravity"] ?? { status: "error", message: "Antigravity quota collection is available on the primary machine only." } };
+    },
     fetchClaude: readClaudeUsageSupplement,
     onRateLimit: () => bb.log.warn("usage limits: a provider was rate-limited; serving last good windows"),
   });

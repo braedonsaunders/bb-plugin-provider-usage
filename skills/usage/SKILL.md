@@ -46,3 +46,7 @@ the trailing-60-second rate, `peakTokensPerMinute` the best rate in the last 15
 minutes, and `threads[]` attributes it to the threads doing the work. Archived
 and deleted threads are omitted. It counts only what BB drives, so an agent
 run outside BB does not appear.
+
+Google Gemini subscriptions use `acp-antigravity` (Google Antigravity). On the primary machine, Provider Usage reads the official CLI’s read-only `/usage` JSON report and shows separate Gemini and Claude/GPT five-hour and weekly windows. The CLI manages Google login and refresh; this plugin never reads its credentials. Remote quota collection requires a collector on that host.
+
+Provider headlines and `totals.cumulativeRemainingPercent` use the most restrictive subscription window per provider, rather than the first window. An exhausted weekly quota therefore shows zero even when the five-hour quota is full. The rail averages these provider figures once per provider; separate paid spending budgets do not replace subscription windows.

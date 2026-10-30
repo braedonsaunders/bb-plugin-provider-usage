@@ -22,7 +22,10 @@ export function normalizeProviderLimits(
 ): Record<ProviderKey, ProviderLimitSlice> {
   return Object.fromEntries(
     PROVIDER_KEYS.map((key) => {
-      return [key, asLimitSlice(pickProviderLimitRaw(raw, key))];
+      const value = pickProviderLimitRaw(raw, key);
+      return [key, key === "antigravity" && value === undefined
+        ? { status: "not_installed" }
+        : asLimitSlice(value)];
     }),
   ) as Record<ProviderKey, ProviderLimitSlice>;
 }

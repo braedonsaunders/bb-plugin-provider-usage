@@ -188,8 +188,8 @@ test("muse subscription windows reach the provider row and the sidebar total", (
       ["Weekly limit", 60],
     ],
   );
-  // The sidebar % is the mean of each provider's lead window: Codex 100, Muse 80.
-  assert.equal(snapshot.totals.cumulativeRemainingPercent, 90);
+  // The sidebar averages usable remaining: Codex 100, Muse's weekly limit 60.
+  assert.equal(snapshot.totals.cumulativeRemainingPercent, 80);
   assert.equal(snapshot.totals.okProviders, 2);
   assert.equal(snapshot.totals.nextResetAt, "2026-10-09T04:43:03.000Z");
   assert.match(formatDashboardText(snapshot), /Muse Code[\s\S]*5-hour limit\s+80% left/);

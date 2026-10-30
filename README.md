@@ -33,7 +33,10 @@ thirds shows whatever is selected:
   Cost-backed windows also show the amount used and the period cap.
 
 Every meter counts **down** — rings, bars and numbers all show what remains,
-the way each provider states its own limits. Providers no longer stack down the
+the way each provider states its own limits. Each provider’s headline uses its
+most restrictive subscription window: a full five-hour allowance cannot hide an
+exhausted weekly allowance. The navigation rail percentage averages those same
+provider figures, counting each provider once. Providers no longer stack down the
 page: adding one adds a list row, and a pool's accounts live in that provider's
 pane rather than stretching the whole section.
 
@@ -53,6 +56,14 @@ the Muse Code provider plugin (0.16 or later) has seen one Muse turn on that
 machine. Before that first turn the row shows the account without a meter. Its
 lead window counts toward the totals and the rail badge like any other
 provider's.
+
+Google Antigravity appears when `acp-antigravity` is registered in BB. On the
+primary machine, the panel reads `agy -p /usage --output-format json`, a
+read-only command that spends no model tokens. It shows Google's five-hour
+and weekly limits separately for Gemini and Claude/GPT models, with reset
+times. The CLI manages its own login and refresh; the plugin never reads or
+stores credentials. Missing quota values remain unknown. Remote machines need
+their own quota collector and never borrow the primary machine's login.
 
 **Pooled accounts.** With routing enabled, each account shows the quota and
 availability reported by `bb pool status --json`. Pool observations remain

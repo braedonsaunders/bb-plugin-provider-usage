@@ -1,4 +1,4 @@
-export const PROVIDER_KEYS = ["codex", "claudeCode", "cursor", "muse"] as const;
+export const PROVIDER_KEYS = ["codex", "claudeCode", "cursor", "muse", "antigravity"] as const;
 export type ProviderKey = (typeof PROVIDER_KEYS)[number];
 
 export const PROVIDER_META: Record<
@@ -33,6 +33,12 @@ export const PROVIDER_META: Record<
     displayName: "Muse Code",
     fallbackLogoUrl: "/api/v1/system/providers/muse/logo",
     matchIds: ["muse"],
+  },
+  antigravity: {
+    id: "acp-antigravity",
+    displayName: "Google Antigravity",
+    fallbackLogoUrl: "/api/v1/system/providers/acp-antigravity/logo",
+    matchIds: ["acp-antigravity", "antigravity"],
   },
 };
 
@@ -147,7 +153,7 @@ export interface UsageTotals {
   windowCount: number;
   averageUsedPercent: number | null;
   averageRemainingPercent: number | null;
-  /** Mean remaining of each signed-in provider's primary window. */
+  /** Mean remaining of each provider's most restrictive subscription window. */
   cumulativeRemainingPercent: number | null;
   tightest: {
     providerId: string;
@@ -403,7 +409,8 @@ export function tightestWindow(windows: UsageWindow[] | undefined): UsageWindow 
 
 export function heroWindow(provider: ProviderUsage): UsageWindow | undefined {
   if (provider.pooled) return tightestWindow(availableAccount(provider)?.windows);
-  return provider.windows.find((window) => !window.cost) ?? provider.windows[0];
+  const subscription = provider.windows.filter((window) => !window.cost);
+  return tightestWindow(subscription.length ? subscription : provider.windows);
 }
 
 export function isActive(provider: ProviderUsage): boolean {
