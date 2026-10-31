@@ -209,28 +209,53 @@ function commandCandidates(explicit?: string): string[] {
   );
 }
 
+type PoolStatusRead =
+  | { kind: "ok"; value: unknown }
+  | { kind: "timeout" }
+  | { kind: "unavailable" };
+
 function runPoolStatus(
   command: string,
   timeoutMs: number,
-): Promise<unknown | null> {
+): Promise<PoolStatusRead> {
   return new Promise((resolve) => {
     execFile(
       command,
       ["pool", "status", "--json"],
       { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
       (error, stdout) => {
+        if (error && (error as { killed?: boolean }).killed) {
+          resolve({ kind: "timeout" });
+          return;
+        }
         if (error || !stdout.trim()) {
-          resolve(null);
+          resolve({ kind: "unavailable" });
           return;
         }
         try {
-          resolve(JSON.parse(stdout));
+          resolve({ kind: "ok", value: JSON.parse(stdout) });
         } catch {
-          resolve(null);
+          resolve({ kind: "unavailable" });
         }
       },
     );
   });
+}
+
+/**
+ * `bb pool status` answers through the bb server, so it slows down with the
+ * server and routinely takes several seconds on a busy machine. A timed-out
+ * read is a slow pool, not a missing one: treating it as empty drops every
+ * pooled provider back to its local login, which for a pool-only Claude setup
+ * reads as "not signed in". So a timeout reuses the last pool that answered.
+ */
+const POOL_STATUS_TIMEOUT_MS = 15_000;
+const POOL_STALE_AFTER_MS = 30 * 60_000;
+let lastPoolStatus: { value: unknown; atMs: number } | null = null;
+
+/** Test hook: forget the last pool that answered. */
+export function resetAccountPoolCache(): void {
+  lastPoolStatus = null;
 }
 
 /**
@@ -243,9 +268,23 @@ export async function readAccountPool(options?: {
   timeoutMs?: number;
   nowMs?: number;
 }): Promise<ProviderPoolAccounts> {
+  const nowMs = options?.nowMs ?? Date.now();
   for (const command of commandCandidates(options?.command)) {
-    const raw = await runPoolStatus(command, options?.timeoutMs ?? 5_000);
-    if (raw !== null) return normalizeAccountPool(raw, options?.nowMs);
+    const read = await runPoolStatus(
+      command,
+      options?.timeoutMs ?? POOL_STATUS_TIMEOUT_MS,
+    );
+    if (read.kind === "ok") {
+      lastPoolStatus = { value: read.value, atMs: nowMs };
+      return normalizeAccountPool(read.value, nowMs);
+    }
+    // The CLI exists and the pool is just slow; another candidate is the same
+    // bb and would only wait out the same timeout again.
+    if (read.kind === "timeout") {
+      return lastPoolStatus && nowMs - lastPoolStatus.atMs < POOL_STALE_AFTER_MS
+        ? normalizeAccountPool(lastPoolStatus.value, nowMs)
+        : {};
+    }
   }
   return {};
 }

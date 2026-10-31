@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 registerHooks({
@@ -15,7 +18,9 @@ registerHooks({
   },
 });
 
-const { normalizeAccountPool } = await import("../lib/account-pool.ts");
+const { normalizeAccountPool, readAccountPool, resetAccountPoolCache } = await import(
+  "../lib/account-pool.ts"
+);
 const { assembleDashboard, formatDashboardText } = await import(
   "../lib/dashboard.ts"
 );
@@ -297,6 +302,45 @@ test("a pool that cannot be read leaves the dashboard untouched", () => {
   assert.deepEqual(normalizeAccountPool(null), {});
   assert.deepEqual(normalizeAccountPool({ accounts: "nonsense" }), {});
   assert.deepEqual(normalizeAccountPool({}), {});
+});
+
+/** A stand-in `bb` that prints `payload`, or hangs when the marker file exists. */
+function fakePoolCli(payload) {
+  const dir = mkdtempSync(join(tmpdir(), "pool-cli-"));
+  const hang = join(dir, "hang");
+  const script = join(dir, "bb");
+  writeFileSync(join(dir, "payload.json"), JSON.stringify(payload));
+  writeFileSync(
+    script,
+    `#!/bin/sh\n[ -e "${hang}" ] && exec sleep 5\ncat "${join(dir, "payload.json")}"\n`,
+  );
+  chmodSync(script, 0o755);
+  return { script, hang };
+}
+
+test("a slow pool read keeps the last pool instead of dropping to the local login", async () => {
+  resetAccountPoolCache();
+  const cli = fakePoolCli(poolStatus());
+  const fresh = await readAccountPool({ command: cli.script, nowMs: 1_000 });
+  assert.equal(fresh.codex?.length, 2);
+
+  writeFileSync(cli.hang, "");
+  const slow = await readAccountPool({ command: cli.script, timeoutMs: 200, nowMs: 2_000 });
+  assert.deepEqual(slow, fresh);
+
+  const stale = await readAccountPool({
+    command: cli.script,
+    timeoutMs: 200,
+    nowMs: 1_000 + 31 * 60_000,
+  });
+  assert.deepEqual(stale, {});
+});
+
+test("a pool that times out before ever answering reports no accounts", async () => {
+  resetAccountPoolCache();
+  const cli = fakePoolCli(poolStatus());
+  writeFileSync(cli.hang, "");
+  assert.deepEqual(await readAccountPool({ command: cli.script, timeoutMs: 200 }), {});
 });
 
 test("a pooled provider survives a host that reports nothing for it", () => {
